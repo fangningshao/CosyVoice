@@ -22,8 +22,12 @@ import multiprocessing
 import time
 import torch
 
+# Global vars
+# utt2wav, utt2text, utt2spk = {}, {}, {}
 
-def job(utt_list, parquet_file, utt2parquet_file, spk2parquet_file):
+
+def job(utt_list, parquet_file, utt2parquet_file, spk2parquet_file, 
+        utt2wav, utt2text, utt2spk, utt2embedding, spk2embedding, utt2speech_token):
     start_time = time.time()
     data_list = []
     for utt in tqdm(utt_list):
@@ -36,6 +40,13 @@ def job(utt_list, parquet_file, utt2parquet_file, spk2parquet_file):
     spkembedding_list = [spk2embedding[utt2spk[utt]] for utt in utt_list]
     speech_token_list = [utt2speech_token[utt] for utt in utt_list]
 
+    # print("wav_list", len(wav_list))
+    # print("text_list", len(text_list))
+    # print("spk_list", len(spk_list))
+    # print("uttembedding_list", len(uttembedding_list))
+    # print("spkembedding_list", len(spkembedding_list))
+    # print("speech_token_list", len(speech_token_list))
+
     # 保存到parquet,utt2parquet_file,spk2parquet_file
     df = pd.DataFrame()
     df['utt'] = utt_list
@@ -46,7 +57,9 @@ def job(utt_list, parquet_file, utt2parquet_file, spk2parquet_file):
     df['utt_embedding'] = uttembedding_list
     df['spk_embedding'] = spkembedding_list
     df['speech_token'] = speech_token_list
+    # print("DEBUG:", df)
     df.to_parquet(parquet_file)
+    # print("DONE:", parquet_file)
     with open(utt2parquet_file, 'w') as f:
         json.dump({k: parquet_file for k in utt_list}, f, ensure_ascii=False, indent=2)
     with open(spk2parquet_file, 'w') as f:
@@ -71,15 +84,16 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     utt2wav, utt2text, utt2spk = {}, {}, {}
-    with open('{}/wav.scp'.format(args.src_dir)) as f:
+    
+    with open('{}/wav.scp'.format(args.src_dir), 'r', encoding='utf-8') as f:
         for l in f:
             l = l.replace('\n', '').split()
             utt2wav[l[0]] = l[1]
-    with open('{}/text'.format(args.src_dir)) as f:
+    with open('{}/text'.format(args.src_dir), 'r', encoding='utf-8') as f:
         for l in f:
             l = l.replace('\n', '').split()
             utt2text[l[0]] = ' '.join(l[1:])
-    with open('{}/utt2spk'.format(args.src_dir)) as f:
+    with open('{}/utt2spk'.format(args.src_dir), 'r', encoding='utf-8') as f:
         for l in f:
             l = l.replace('\n', '').split()
             utt2spk[l[0]] = l[1]
@@ -88,9 +102,11 @@ if __name__ == "__main__":
     utt2speech_token = torch.load('{}/utt2speech_token.pt'.format(args.src_dir))
     utts = list(utt2wav.keys())
 
+    # print("DEBUG", utt2wav['chrp0000'])
     # Using process pool to speedup
     pool = multiprocessing.Pool(processes=args.num_processes)
     parquet_list, utt2parquet_list, spk2parquet_list = [], [], []
+    results = []  # 存储所有异步任务
     for i, j in enumerate(range(0, len(utts), args.num_utts_per_parquet)):
         parquet_file = os.path.join(args.des_dir, 'parquet_{:09d}.tar'.format(i))
         utt2parquet_file = os.path.join(args.des_dir, 'utt2parquet_{:09d}.json'.format(i))
@@ -98,9 +114,33 @@ if __name__ == "__main__":
         parquet_list.append(parquet_file)
         utt2parquet_list.append(utt2parquet_file)
         spk2parquet_list.append(spk2parquet_file)
-        pool.apply_async(job, (utts[j: j + args.num_utts_per_parquet], parquet_file, utt2parquet_file, spk2parquet_file))
-    pool.close()
-    pool.join()
+        # 存储异步任务结果
+        result = pool.apply_async(job, (utts[j: j + args.num_utts_per_parquet], 
+                                      parquet_file, utt2parquet_file, spk2parquet_file,
+                                      utt2wav, utt2text, utt2spk, utt2embedding, spk2embedding, utt2speech_token))
+        results.append(result)
+    
+    # 等待所有任务完成并检查结果
+    for r in results:
+        try:
+            r.get()  # 如果任务失败会抛出异常
+        except Exception as e:
+            logging.error(f"Task failed: {e}")
+            raise
+
+    # # Using process pool to speedup
+    # pool = multiprocessing.Pool(processes=args.num_processes)
+    # parquet_list, utt2parquet_list, spk2parquet_list = [], [], []
+    # for i, j in enumerate(range(0, len(utts), args.num_utts_per_parquet)):
+    #     parquet_file = os.path.join(args.des_dir, 'parquet_{:09d}.tar'.format(i))
+    #     utt2parquet_file = os.path.join(args.des_dir, 'utt2parquet_{:09d}.json'.format(i))
+    #     spk2parquet_file = os.path.join(args.des_dir, 'spk2parquet_{:09d}.json'.format(i))
+    #     parquet_list.append(parquet_file)
+    #     utt2parquet_list.append(utt2parquet_file)
+    #     spk2parquet_list.append(spk2parquet_file)
+    #     pool.apply_async(job, (utts[j: j + args.num_utts_per_parquet], parquet_file, utt2parquet_file, spk2parquet_file))
+    # pool.close()
+    # pool.join()
 
     with open('{}/data.list'.format(args.des_dir), 'w', encoding='utf8') as f1, \
             open('{}/utt2data.list'.format(args.des_dir), 'w', encoding='utf8') as f2, \
