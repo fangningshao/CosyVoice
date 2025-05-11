@@ -62,16 +62,22 @@ class CosyVoiceModel:
         self.flow_cache_dict = {}
         self.hift_cache_dict = {}
 
-    def load(self, llm_model, flow_model, hift_model):
-        self.llm.load_state_dict(torch.load(llm_model, map_location=self.device), strict=True)
+    def load(self, llm_model, flow_model, hift_model, strict=True):
+        self.llm.load_state_dict(torch.load(llm_model, map_location=self.device), strict=strict)
         self.llm.to(self.device).eval()
-        self.flow.load_state_dict(torch.load(flow_model, map_location=self.device), strict=True)
+        self.flow.load_state_dict(torch.load(flow_model, map_location=self.device), strict=strict)
         self.flow.to(self.device).eval()
         # in case hift_model is a hifigan model
         hift_state_dict = {k.replace('generator.', ''): v for k, v in torch.load(hift_model, map_location=self.device).items()}
-        self.hift.load_state_dict(hift_state_dict, strict=True)
+        self.hift.load_state_dict(hift_state_dict, strict=strict)
         self.hift.to(self.device).eval()
 
+        # Load HiFT model
+        hift_state_dict = {k.replace('generator.', ''): v 
+                        for k, v in torch.load(hift_model, map_location=self.device).items()}
+        self.hift.load_state_dict(hift_state_dict, strict=strict)
+        self.hift.to(self.device).eval()
+        
     def load_jit(self, llm_text_encoder_model, llm_llm_model, flow_encoder_model):
         llm_text_encoder = torch.jit.load(llm_text_encoder_model, map_location=self.device)
         self.llm.text_encoder = llm_text_encoder
