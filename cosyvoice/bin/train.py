@@ -21,7 +21,10 @@ from copy import deepcopy
 import os
 import torch
 import torch.distributed as dist
-import deepspeed
+try:
+    import deepspeed
+except:
+    pass
 
 from hyperpyyaml import load_hyperpyyaml
 
@@ -82,7 +85,11 @@ def get_args():
                         default=60,
                         type=int,
                         help='timeout (in seconds) of cosyvoice_join.')
-    parser = deepspeed.add_config_arguments(parser)
+    try:
+        parser = deepspeed.add_config_arguments(parser)
+    except:
+        # use a default parser
+        pass
     args = parser.parse_args()
     return args
 
@@ -163,6 +170,17 @@ def main():
         train_dataset.set_epoch(epoch)
         dist.barrier()
         group_join = dist.new_group(backend="gloo", timeout=datetime.timedelta(seconds=args.timeout))
+        # Print each of (model, optimizer, scheduler, train_data_loader, cv_data_loader, writer, info_dict, scaler, group_join)
+        logging.info('model: {}'.format(model))
+        logging.info('optimizer: {}'.format(optimizer))
+        logging.info('scheduler: {}'.format(scheduler))
+        logging.info('train_data_loader: {}'.format(train_data_loader))
+        logging.info('cv_data_loader: {}'.format(cv_data_loader))
+        logging.info('writer: {}'.format(writer))
+        logging.info('info_dict: {}'.format(info_dict))
+        logging.info('scaler: {}'.format(scaler))
+        logging.info('group_join: {}'.format(group_join))
+        
         if gan is True:
             executor.train_one_epoc_gan(model, optimizer, scheduler, optimizer_d, scheduler_d, train_data_loader, cv_data_loader,
                                         writer, info_dict, scaler, group_join)

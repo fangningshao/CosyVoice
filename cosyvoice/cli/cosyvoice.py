@@ -140,7 +140,7 @@ class CosyVoice:
 
 class CosyVoice2(CosyVoice):
 
-    def __init__(self, model_dir, load_jit=False, load_trt=False, fp16=False, use_flow_cache=False):
+    def __init__(self, model_dir, load_jit=False, load_trt=False, fp16=False, use_flow_cache=False, strict_load=True, flow_ckpt=None, llm_ckpt=None):
         self.instruct = True if '-Instruct' in model_dir else False
         self.model_dir = model_dir
         self.fp16 = fp16
@@ -163,9 +163,16 @@ class CosyVoice2(CosyVoice):
             load_jit, load_trt, fp16 = False, False, False
             logging.warning('no cuda device, set load_jit/load_trt/fp16 to False')
         self.model = CosyVoice2Model(configs['llm'], configs['flow'], configs['hift'], fp16, use_flow_cache)
-        self.model.load('{}/llm.pt'.format(model_dir),
-                        '{}/flow.pt'.format(model_dir) if use_flow_cache is False else '{}/flow.cache.pt'.format(model_dir),
-                        '{}/hift.pt'.format(model_dir))
+
+        if not flow_ckpt:
+            # Also support custom flow ckpt
+            flow_ckpt = '{}/flow.pt'.format(model_dir) if use_flow_cache is False else '{}/flow.cache.pt'.format(model_dir)
+        if not llm_ckpt:
+            # Also support custom flow ckpt
+            llm_ckpt = '{}/llm.pt'.format(model_dir)
+        self.model.load(llm_ckpt,
+                        flow_ckpt,
+                        '{}/hift.pt'.format(model_dir), strict=strict_load)
         if load_jit:
             self.model.load_jit('{}/flow.encoder.{}.zip'.format(model_dir, 'fp16' if self.fp16 is True else 'fp32'))
         if load_trt:
