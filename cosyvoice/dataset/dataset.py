@@ -148,6 +148,10 @@ def Dataset(data_list_file,
         with open(tts_file) as f:
             tts_data = json.load(f)
         utt2lists = read_json_lists(prompt_utt2data)
+        print('len utt2lists:', len(tts_data))
+        print("utt2lists: ", utt2lists[:10])
+        raise ValueError('Please check the utt2lists file, it should be a json file')
+    
         # filter unnecessary file in inference mode
         lists = list({utt2lists[utt] for utt in tts_data.keys() if utt2lists[utt] in lists})
     dataset = DataList(lists,

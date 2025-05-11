@@ -33,6 +33,7 @@ def read_json_lists(list_file):
     lists = read_lists(list_file)
     results = {}
     for fn in lists:
+        print("DEBUG fn", fn)
         with open(fn, 'r', encoding='utf8') as fin:
             results.update(json.load(fin))
     return results

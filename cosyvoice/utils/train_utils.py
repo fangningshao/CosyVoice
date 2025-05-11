@@ -22,7 +22,10 @@ import re
 import datetime
 import yaml
 
-import deepspeed
+try:
+    import deepspeed
+except:
+    pass
 import torch.optim as optim
 import torch.distributed as dist
 
@@ -30,7 +33,10 @@ from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader
 from torch.nn.utils import clip_grad_norm_
 
-from deepspeed.runtime.zero.stage_1_and_2 import estimate_zero2_model_states_mem_needs_all_live
+try:
+    from deepspeed.runtime.zero.stage_1_and_2 import estimate_zero2_model_states_mem_needs_all_live
+except:
+    pass
 
 from cosyvoice.dataset.dataset import Dataset
 from cosyvoice.utils.scheduler import WarmupLR, NoamHoldAnnealing, ConstantLR
@@ -52,6 +58,8 @@ def init_distributed(args):
 
 def init_dataset_and_dataloader(args, configs, gan):
     data_pipeline = configs['data_pipeline_gan'] if gan is True else configs['data_pipeline']
+    logging.info("data pipeline: {}".format(data_pipeline))
+
     train_dataset = Dataset(args.train_data, data_pipeline=data_pipeline, mode='train', gan=gan, shuffle=True, partition=True)
     cv_dataset = Dataset(args.cv_data, data_pipeline=data_pipeline, mode='train', gan=gan, shuffle=False, partition=False)
 
@@ -214,16 +222,39 @@ def save_model(model, model_name, info_dict):
         logging.info('[Rank {}] Checkpoint: save to checkpoint {}'.format(rank, save_model_path))
 
 
+# def cosyvoice_join(group_join, info_dict):
+#     world_size = int(os.environ.get('WORLD_SIZE', 1))
+#     local_rank = int(os.environ.get('LOCAL_RANK', 0))
+#     rank = int(os.environ.get('RANK', 0))
+
+#     if info_dict["batch_idx"] != 0:
+#         # we try to join all rank in both ddp and deepspeed mode, in case different rank has different lr
+#         try:
+#             dist.monitored_barrier(group=group_join,
+#                                    timeout=group_join.options._timeout)
+#             return False
+#         except RuntimeError as e:
+#             logging.info("Detected uneven workload distribution: {}\n".format(e) +
+#                          "Break current worker to manually join all workers, " +
+#                          "world_size {}, current rank {}, current local_rank {}\n".
+#                          format(world_size, rank, local_rank))
+#             return True
+#     else:
+#         return False
+
 def cosyvoice_join(group_join, info_dict):
+    """Modified join function to handle ProcessGroup changes"""
+    if group_join is None:
+        return False
+        
     world_size = int(os.environ.get('WORLD_SIZE', 1))
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     rank = int(os.environ.get('RANK', 0))
 
     if info_dict["batch_idx"] != 0:
-        # we try to join all rank in both ddp and deepspeed mode, in case different rank has different lr
         try:
-            dist.monitored_barrier(group=group_join,
-                                   timeout=group_join.options._timeout)
+            # 使用新的 barrier 方式，不依赖 options._timeout
+            dist.barrier(group=group_join)
             return False
         except RuntimeError as e:
             logging.info("Detected uneven workload distribution: {}\n".format(e) +
@@ -247,13 +278,43 @@ def batch_forward(model, batch, scaler, info_dict):
         dtype = torch.float32
 
     if info_dict['train_engine'] == 'torch_ddp':
-        autocast = torch.cuda.amp.autocast(enabled=scaler is not None)
+        # 使用新的 autocast API
+        autocast = torch.amp.autocast('cuda', enabled=scaler is not None)
     else:
-        autocast = torch.cuda.amp.autocast(enabled=True, dtype=dtype, cache_enabled=False)
+        autocast = torch.amp.autocast('cuda', enabled=True, dtype=dtype, cache_enabled=False)
 
     with autocast:
         info_dict['loss_dict'] = model(batch, device)
     return info_dict
+
+# [rank0]: AttributeError: 'torch._C._distributed_c10d.ProcessGroup' object has no attribute 'options'
+# 主要修改：
+# 在 cosyvoice_join 中:
+# 移除了 monitored_barrier 和 options._timeout 的使用
+# 改用简单的 barrier 调用
+# 在 batch_forward 中:
+# 将 torch.cuda.amp.autocast 改为 torch.amp.autocast('cuda')
+# 保持其他逻辑不变
+
+# def batch_forward(model, batch, scaler, info_dict):
+#     device = int(os.environ.get('LOCAL_RANK', 0))
+
+#     dtype = info_dict["dtype"]
+#     if dtype == "fp16":
+#         dtype = torch.float16
+#     elif dtype == "bf16":
+#         dtype = torch.bfloat16
+#     else:  # fp32
+#         dtype = torch.float32
+
+#     if info_dict['train_engine'] == 'torch_ddp':
+#         autocast = torch.cuda.amp.autocast(enabled=scaler is not None)
+#     else:
+#         autocast = torch.cuda.amp.autocast(enabled=True, dtype=dtype, cache_enabled=False)
+
+#     with autocast:
+#         info_dict['loss_dict'] = model(batch, device)
+#     return info_dict
 
 
 def batch_backward(model, scaler, info_dict):
