@@ -7,7 +7,14 @@ from cosyvoice.cli.cosyvoice import CosyVoice, CosyVoice2
 from cosyvoice.utils.file_utils import load_wav
 import torchaudio # type: ignore
 
-def main(input_file=None, output_dir=None, flow_ckpt=None, llm_ckpt=None, prompt_name='cvyo_mixed_000119', language=None, filename_prefix='cvyo', base_model_path='D:\\models\\cosyvoice_models\\CosyVoice2-0.5B-exp01'):
+def clean_line_for_tts(line):
+    # To fix the pronunciation.
+    return line.replace("there's", "theirs").replace("There's", "Theirs")
+
+
+# Add the trimming logic to both inference sections:
+
+def main(input_file=None, output_dir=None, flow_ckpt=None, llm_ckpt=None, prompt_name='cvyo_mixed_000119', language=None, filename_prefix='cvyo', trim_ending_ms=40, base_model_path='D:\\repos\\tts\\CosyVoice\\pretrained_models\\CosyVoice2-0.5B'):
     """Based on each line in input_file, clone the voice and save the result to output_dir.
     """
     if not output_dir:
@@ -26,33 +33,60 @@ def main(input_file=None, output_dir=None, flow_ckpt=None, llm_ckpt=None, prompt
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
+    # Set trimming parameters
+    trim_ending = trim_ending_ms  # 40ms trim
+    
     for idx, line in enumerate(lines):
         line = line.strip()
+        line = clean_line_for_tts(line)
         if not line:
             continue
+        filename = f'{filename_prefix}_{str(idx).zfill(4)}'
+        parts = line.strip().split('\t', 1)
+        if len(parts) == 2:
+            filename = parts[0]
+            line = parts[1]
         start_time = time.time()
         if not language:
             for i, j in enumerate(cosyvoice.inference_zero_shot(line, prompt_text, prompt_speech_16k, stream=False)):
-                # fill filenames such as cvyo_0000.wav, cvyo_0001.wav, etc.
+                # Get the generated audio
+                final_audio = j['tts_speech']
+                
+                # Apply ending trim if specified
+                if trim_ending > 0:
+                    trim_samples = int(trim_ending * cosyvoice.sample_rate / 1000)
+                    if final_audio.shape[1] > trim_samples * 2:  # Only trim if enough samples
+                        final_audio = final_audio[:, :-trim_samples]
+                        print(f"Trimmed {trim_ending}ms ({trim_samples} samples) from end")
+                
+                # Save the trimmed audio
                 if i == 0:
-                    output_path = os.path.join(output_dir, f'{filename_prefix}_{str(idx).zfill(4)}.wav')
+                    output_path = os.path.join(output_dir, f"{filename}.wav")
                 else:
-                    output_path = os.path.join(output_dir, f'{filename_prefix}_{str(idx).zfill(4)}_{i}.wav')
-                torchaudio.save(output_path, j['tts_speech'], cosyvoice.sample_rate)
+                    output_path = os.path.join(output_dir, f"{filename}_{i}.wav")
+                torchaudio.save(output_path, final_audio, cosyvoice.sample_rate)
 
             print('inference_zero_shot time:', time.time() - start_time)
         else:  # with language
-
             for i, j in enumerate(cosyvoice.inference_instruct2(line, f'用{language}说这句话', prompt_speech_16k, stream=False)):
-                # fill filenames such as cvyo_0000.wav, cvyo_0001.wav, etc.
+                # Get the generated audio
+                final_audio = j['tts_speech']
+                
+                # Apply ending trim if specified
+                if trim_ending > 0:
+                    trim_samples = int(trim_ending * cosyvoice.sample_rate / 1000)
+                    if final_audio.shape[1] > trim_samples * 2:  # Only trim if enough samples
+                        final_audio = final_audio[:, :-trim_samples]
+                        print(f"Trimmed {trim_ending}ms ({trim_samples} samples) from end")
+                
+                # Save the trimmed audio
                 if i == 0:
                     output_path = os.path.join(output_dir, f'{filename_prefix}_{str(idx).zfill(4)}.wav')
                 else:
                     output_path = os.path.join(output_dir, f'{filename_prefix}_{str(idx).zfill(4)}_{i}.wav')
-                torchaudio.save(output_path, j['tts_speech'], cosyvoice.sample_rate)
+                torchaudio.save(output_path, final_audio, cosyvoice.sample_rate)
 
-            print('inference_zero_shot time:', time.time() - start_time)
-
+            print('inference_instruct2 time:', time.time() - start_time)
 
 if __name__ == "__main__":
     argh.dispatch_command(main)
@@ -63,3 +97,4 @@ Usage:
 
 python clone_exp_general.py -i test_mixed_scripts.txt -o test_mixed_exp01 --llm-ckpt 20250501_llm_exp01_zh\epoch_1234_whole.pt --flow-ckpt 20250501_flow_exp02\epoch_5678_whole.pt
 """
+# python clone_exp_general.py -i test_mixed_scripts.txt -o test_multi_exp06 --llm-ckpt "D:\models\cosyvoice_models\CosyVoice2-0.5B\cosyvoice2_exp06_llm_multi_lr2e-6_epoch8.pt"
