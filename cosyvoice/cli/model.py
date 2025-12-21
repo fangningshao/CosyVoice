@@ -62,10 +62,28 @@ class CosyVoiceModel:
         self.hift_cache_dict = {}
 
     def load(self, llm_model, flow_model, hift_model):
-        self.llm.load_state_dict(torch.load(llm_model, map_location=self.device), strict=True)
+        # Load LLM model and filter out non-model keys
+        llm_checkpoint = torch.load(llm_model, map_location=self.device)
+        if isinstance(llm_checkpoint, dict) and any(k in llm_checkpoint for k in ['epoch', 'step', 'optimizer', 'scheduler']):
+            # Training checkpoint format - extract only model weights
+            llm_state_dict = {k: v for k, v in llm_checkpoint.items() if k not in ['epoch', 'step', 'optimizer', 'scheduler', 'save_time']}
+        else:
+            # Already a state dict
+            llm_state_dict = llm_checkpoint
+        self.llm.load_state_dict(llm_state_dict, strict=True)
         self.llm.to(self.device).eval()
-        self.flow.load_state_dict(torch.load(flow_model, map_location=self.device), strict=True)
+        
+        # Load flow model and filter out non-model keys
+        flow_checkpoint = torch.load(flow_model, map_location=self.device)
+        if isinstance(flow_checkpoint, dict) and any(k in flow_checkpoint for k in ['epoch', 'step', 'optimizer', 'scheduler']):
+            # Training checkpoint format - extract only model weights
+            flow_state_dict = {k: v for k, v in flow_checkpoint.items() if k not in ['epoch', 'step', 'optimizer', 'scheduler', 'save_time']}
+        else:
+            # Already a state dict
+            flow_state_dict = flow_checkpoint
+        self.flow.load_state_dict(flow_state_dict, strict=True)
         self.flow.to(self.device).eval()
+
         # in case hift_model is a hifigan model
         hift_state_dict = {k.replace('generator.', ''): v for k, v in torch.load(hift_model, map_location=self.device).items()}
         self.hift.load_state_dict(hift_state_dict, strict=True)

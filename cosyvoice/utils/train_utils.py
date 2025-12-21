@@ -22,7 +22,11 @@ import re
 import datetime
 import yaml
 
-import deepspeed
+try:
+    import deepspeed
+    from deepspeed.runtime.zero.stage_1_and_2 import estimate_zero2_model_states_mem_needs_all_live
+except:
+    pass
 import torch.optim as optim
 import torch.distributed as dist
 
@@ -30,7 +34,7 @@ from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader
 from torch.nn.utils import clip_grad_norm_
 
-from deepspeed.runtime.zero.stage_1_and_2 import estimate_zero2_model_states_mem_needs_all_live
+
 
 from cosyvoice.dataset.dataset import Dataset
 from cosyvoice.utils.scheduler import WarmupLR, NoamHoldAnnealing, ConstantLR
@@ -222,8 +226,16 @@ def cosyvoice_join(group_join, info_dict):
     if info_dict["batch_idx"] != 0:
         # we try to join all rank in both ddp and deepspeed mode, in case different rank has different lr
         try:
-            dist.monitored_barrier(group=group_join,
-                                   timeout=group_join.options._timeout)
+            # Get timeout - handle different PyTorch versions
+            try:
+                # Get the backend from the distributed process group
+                backend = dist.get_backend(group_join)
+                timeout = dist.distributed_c10d._get_default_timeout(backend)
+            except (AttributeError, RuntimeError, TypeError):
+                # Fallback to default timeout (30 minutes)
+                timeout = datetime.timedelta(seconds=1800)
+            
+            dist.monitored_barrier(group=group_join, timeout=timeout)
             return False
         except RuntimeError as e:
             logging.info("Detected uneven workload distribution: {}\n".format(e) +
