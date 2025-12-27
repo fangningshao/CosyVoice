@@ -24,10 +24,7 @@ import yaml
 
 try:
     import deepspeed
-<<<<<<< HEAD
     from deepspeed.runtime.zero.stage_1_and_2 import estimate_zero2_model_states_mem_needs_all_live
-=======
->>>>>>> 53fd402 (Do not enforce deepspeed)
 except:
     pass
 import torch.optim as optim
@@ -36,15 +33,6 @@ import torch.distributed as dist
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader
 from torch.nn.utils import clip_grad_norm_
-
-<<<<<<< HEAD
-
-=======
-try:
-    from deepspeed.runtime.zero.stage_1_and_2 import estimate_zero2_model_states_mem_needs_all_live
-except:
-    pass
->>>>>>> 53fd402 (Do not enforce deepspeed)
 
 from cosyvoice.dataset.dataset import Dataset
 from cosyvoice.utils.scheduler import WarmupLR, NoamHoldAnnealing, ConstantLR
