@@ -331,9 +331,40 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
         mask = (~make_pad_mask(token_len)).float().unsqueeze(-1).to(device)
         token = self.input_embedding(torch.clamp(token, min=0)) * mask
 
-        # text encode
-        h, h_lengths = self.encoder(token, token_len, streaming=streaming)
-        h = self.encoder_proj(h)
+        # # text encode  (Original CV2 code)
+        # h, h_lengths = self.encoder(token, token_len, streaming=streaming)
+        # h = self.encoder_proj(h)
+
+        # NEW CODE (CosyVoice 3 - no encoder, use pre_lookahead_layer if available):
+        # text encode (CV2 and CV3 compatible)
+        if hasattr(self, 'pre_lookahead_layer') and self.pre_lookahead_layer is not None:
+            # CosyVoice 3: use pre_lookahead_layer (DiT architecture)
+            h = self.pre_lookahead_layer(token)
+            # Upsample h to match mel frame length
+            h = h.repeat_interleave(self.token_mel_ratio, dim=1)
+
+            # Align h with feat length exactly (handle rounding differences)
+            # Truncate or pad to match feat's sequence length
+            batch_size, h_seq_len, h_dim = h.shape
+            _, feat_seq_len, _ = feat.shape
+
+            if h_seq_len < feat_seq_len:
+                # Pad h if it's shorter
+                padding = torch.zeros(batch_size, feat_seq_len - h_seq_len, h_dim, device=h.device, dtype=h.dtype)
+                h = torch.cat([h, padding], dim=1)
+            elif h_seq_len > feat_seq_len:
+                # Truncate h if it's longer
+                h = h[:, :feat_seq_len, :]
+
+            # Use feat_len as the effective length since we aligned h to feat
+            h_lengths = feat_len
+
+        elif hasattr(self, 'encoder') and self.encoder is not None:
+            # CosyVoice 2: use encoder + encoder_proj
+            h, h_lengths = self.encoder(token, token_len, streaming=streaming)
+            h = self.encoder_proj(h)
+        else:
+            raise AttributeError("Model has neither 'encoder' nor 'pre_lookahead_layer'. Cannot process tokens.")
 
         # get conditions
         conds = torch.zeros(feat.shape, device=token.device)
@@ -344,7 +375,14 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
             conds[i, :index] = feat[i, :index]
         conds = conds.transpose(1, 2)
 
-        mask = (~make_pad_mask(h_lengths.sum(dim=-1).squeeze(dim=1))).to(h)
+        # Handle mask creation based on h_lengths dimensionality
+        if h_lengths.dim() == 1:
+            # CV3: h_lengths is 1D [batch]
+            mask = (~make_pad_mask(h_lengths)).to(h)
+        else:
+            # CV2: h_lengths is 2D [batch, chunks]
+            mask = (~make_pad_mask(h_lengths.sum(dim=-1).squeeze(dim=1))).to(h)
+
         loss, _ = self.decoder.compute_loss(
             feat.transpose(1, 2).contiguous(),
             mask.unsqueeze(1),
