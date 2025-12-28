@@ -27,7 +27,7 @@ import torch
 
 
 def job(utt_list, parquet_file, utt2parquet_file, spk2parquet_file, 
-        utt2wav, utt2text, utt2spk, utt2embedding, spk2embedding, utt2speech_token):
+        utt2wav, utt2text, utt2spk, utt2embedding, spk2embedding, utt2speech_token, args_dpo, args_instruct):
     start_time = time.time()
     data_list = []
     for utt in tqdm(utt_list):
@@ -39,9 +39,9 @@ def job(utt_list, parquet_file, utt2parquet_file, spk2parquet_file,
     uttembedding_list = [utt2embedding[utt] for utt in utt_list]
     spkembedding_list = [spk2embedding[utt2spk[utt]] for utt in utt_list]
     speech_token_list = [utt2speech_token.get(utt, []) for utt in utt_list]
-    if args.dpo:
+    if args_dpo:
         reject_speech_token_list = [utt2reject_speech_token[utt] for utt in utt_list]
-    if args.instruct:
+    if args_instruct:
         instruct_list = [utt2instruct[utt] for utt in utt_list]
 
     # print("wav_list", len(wav_list))
@@ -61,12 +61,12 @@ def job(utt_list, parquet_file, utt2parquet_file, spk2parquet_file,
     df['utt_embedding'] = uttembedding_list
     df['spk_embedding'] = spkembedding_list
     df['speech_token'] = speech_token_list
-    if args.dpo:
+    if args_dpo:
         df['reject_speech_token'] = reject_speech_token_list
-    if args.instruct:
+    if args_instruct:
         df['instruct'] = instruct_list
     df.to_parquet(parquet_file)
-    # print("DONE:", parquet_file)
+    print("DONE:", parquet_file)
     with open(utt2parquet_file, 'w') as f:
         json.dump({k: parquet_file for k in utt_list}, f, ensure_ascii=False, indent=2)
     with open(spk2parquet_file, 'w') as f:
@@ -98,14 +98,9 @@ if __name__ == "__main__":
                         help='Use Direct Preference Optimization')
     args = parser.parse_args()
 
-<<<<<<< HEAD
     utt2wav, utt2text, utt2spk, utt2instruct = {}, {}, {}, {}
-    with open('{}/wav.scp'.format(args.src_dir)) as f:
-=======
-    utt2wav, utt2text, utt2spk = {}, {}, {}
-    
+    # with open('{}/wav.scp'.format(args.src_dir)) as f:
     with open('{}/wav.scp'.format(args.src_dir), 'r', encoding='utf-8') as f:
->>>>>>> 9e209af (Fix encodings for make_parquet_list)
         for l in f:
             l = l.replace('\n', '').split()
             utt2wav[l[0]] = l[1]
@@ -144,8 +139,11 @@ if __name__ == "__main__":
         # 存储异步任务结果
         result = pool.apply_async(job, (utts[j: j + args.num_utts_per_parquet], 
                                       parquet_file, utt2parquet_file, spk2parquet_file,
-                                      utt2wav, utt2text, utt2spk, utt2embedding, spk2embedding, utt2speech_token))
+                                      utt2wav, utt2text, utt2spk, utt2embedding, spk2embedding, utt2speech_token, args.dpo, args.instruct))
         results.append(result)
+
+    # Close pool before waiting for results
+    pool.close()
     
     # 等待所有任务完成并检查结果
     for r in results:
@@ -155,19 +153,8 @@ if __name__ == "__main__":
             logging.error(f"Task failed: {e}")
             raise
 
-    # # Using process pool to speedup
-    # pool = multiprocessing.Pool(processes=args.num_processes)
-    # parquet_list, utt2parquet_list, spk2parquet_list = [], [], []
-    # for i, j in enumerate(range(0, len(utts), args.num_utts_per_parquet)):
-    #     parquet_file = os.path.join(args.des_dir, 'parquet_{:09d}.tar'.format(i))
-    #     utt2parquet_file = os.path.join(args.des_dir, 'utt2parquet_{:09d}.json'.format(i))
-    #     spk2parquet_file = os.path.join(args.des_dir, 'spk2parquet_{:09d}.json'.format(i))
-    #     parquet_list.append(parquet_file)
-    #     utt2parquet_list.append(utt2parquet_file)
-    #     spk2parquet_list.append(spk2parquet_file)
-    #     pool.apply_async(job, (utts[j: j + args.num_utts_per_parquet], parquet_file, utt2parquet_file, spk2parquet_file))
-    # pool.close()
-    # pool.join()
+    # Join to ensure all processes are terminated properly
+    pool.join()
 
     with open('{}/data.list'.format(args.des_dir), 'w', encoding='utf8') as f1, \
             open('{}/utt2data.list'.format(args.des_dir), 'w', encoding='utf8') as f2, \
