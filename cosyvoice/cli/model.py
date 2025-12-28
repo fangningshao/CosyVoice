@@ -61,7 +61,6 @@ class CosyVoiceModel:
         self.flow_cache_dict = {}
         self.hift_cache_dict = {}
 
-<<<<<<< HEAD
     def load(self, llm_model, flow_model, hift_model, strict=True):
         # Load LLM model and filter out non-model keys
         llm_checkpoint = torch.load(llm_model, map_location=self.device)

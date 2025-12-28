@@ -54,15 +54,8 @@ def init_distributed(args):
 
 def init_dataset_and_dataloader(args, configs, gan, dpo):
     data_pipeline = configs['data_pipeline_gan'] if gan is True else configs['data_pipeline']
-<<<<<<< HEAD
     train_dataset = Dataset(args.train_data, data_pipeline=data_pipeline, mode='train', gan=gan, dpo=dpo, shuffle=True, partition=True)
     cv_dataset = Dataset(args.cv_data, data_pipeline=data_pipeline, mode='train', gan=gan, dpo=dpo, shuffle=False, partition=False)
-=======
-    logging.info("data pipeline: {}".format(data_pipeline))
-
-    train_dataset = Dataset(args.train_data, data_pipeline=data_pipeline, mode='train', gan=gan, shuffle=True, partition=True)
-    cv_dataset = Dataset(args.cv_data, data_pipeline=data_pipeline, mode='train', gan=gan, shuffle=False, partition=False)
->>>>>>> 53fd402 (Do not enforce deepspeed)
 
     # do not use persistent_workers=True, as whisper tokenizer opens tiktoken file each time when the for loop starts
     train_data_loader = DataLoader(train_dataset,
@@ -279,12 +272,9 @@ def batch_forward(model, batch, scaler, info_dict, ref_model=None, dpo_loss=None
         dtype = torch.float32
 
     if info_dict['train_engine'] == 'torch_ddp':
-<<<<<<< HEAD
-        autocast = torch.cuda.amp.autocast(enabled=scaler is not None, dtype=dtype)
-=======
         # 使用新的 autocast API
         autocast = torch.amp.autocast('cuda', enabled=scaler is not None)
->>>>>>> 53fd402 (Do not enforce deepspeed)
+        # autocast = torch.cuda.amp.autocast(enabled=scaler is not None, dtype=dtype)
     else:
         autocast = torch.amp.autocast('cuda', enabled=True, dtype=dtype, cache_enabled=False)
 
