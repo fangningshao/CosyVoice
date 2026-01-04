@@ -675,12 +675,43 @@ class CosyVoice3LM(Qwen2LM):
         text_token_len = batch['text_token_len'].to(device)
         speech_token = batch['speech_token'].to(device)
         speech_token_len = batch['speech_token_len'].to(device)
-        # NOTE should append instruct_token to sequence, not implemented yet
-        instruct_token = batch['instruct_token'].to(device)
-        instruct_token_len = batch['instruct_token_len'].to(device)
+        
+        # Handle missing instruct tokens (for CV2 data compatibility)
+        if 'instruct_token' not in batch or batch['instruct_token'] is None:
+            # Tokenize default instruction prompt
+            from transformers import AutoTokenizer
+            if not hasattr(self, 'tokenizer'):
+                # Cache tokenizer (load once)
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    self.llm.model.config._name_or_path,
+                    trust_remote_code=True
+                )
+                self.default_instruct_prompt = "You are a helpful assistant."
+                self.default_instruct_tokens = torch.tensor(
+                    self.tokenizer.encode(self.default_instruct_prompt, add_special_tokens=False),
+                    dtype=torch.long
+                )
+            
+            batch_size = text_token.shape[0]
+            # Repeat for batch
+            instruct_token = self.default_instruct_tokens.unsqueeze(0).repeat(batch_size, 1).to(device)
+            instruct_token_len = torch.full((batch_size,), instruct_token.shape[1], dtype=torch.long, device=device)
+            logging.debug(f"Using default instruct prompt: '{self.default_instruct_prompt}' (tokens={instruct_token.shape[1]})")
+        else:
+            instruct_token = batch['instruct_token'].to(device)
+            instruct_token_len = batch['instruct_token_len'].to(device)
 
-        # 1. encode text_token
-        text_token_emb = self.llm.model.model.embed_tokens(text_token)
+        # 1. encode instruct_token + text_token
+        if instruct_token.shape[1] > 0:
+            # Concatenate instruct before text
+            combined_token = torch.cat([instruct_token, text_token], dim=1)
+            combined_token_len = instruct_token_len + text_token_len
+            text_token_emb = self.llm.model.model.embed_tokens(combined_token)
+            # Update lengths to include instruct
+            text_token_len = combined_token_len
+        else:
+            # No instruct, use text only
+            text_token_emb = self.llm.model.model.embed_tokens(text_token)
 
         # 3. sos and task_id
         sos_emb = self.speech_embedding.weight[self.sos].reshape(1, 1, -1)
@@ -690,7 +721,9 @@ class CosyVoice3LM(Qwen2LM):
         speech_token_emb = self.speech_embedding(speech_token)
 
         # 3. prepare llm_input/target
-        lm_target, lm_input, lm_input_len = self.prepare_lm_input_target(sos_emb, text_token, text_token_emb, text_token_len, task_id_emb,
+        # Note: text_token now includes instruct, so we need to pass the combined version
+        combined_text_token = torch.cat([instruct_token, text_token], dim=1) if instruct_token.shape[1] > 0 else text_token
+        lm_target, lm_input, lm_input_len = self.prepare_lm_input_target(sos_emb, combined_text_token, text_token_emb, text_token_len, task_id_emb,
                                                                          speech_token, speech_token_emb, speech_token_len)
         lm_target = lm_target.to(device)
 
@@ -698,8 +731,9 @@ class CosyVoice3LM(Qwen2LM):
         lm_output, lm_output_mask = self.llm(lm_input, lm_input_len.to(device))
         logits = self.llm_decoder(lm_output)
         loss = self.criterion_ce(logits, lm_target.to(device))
-        acc = th_accuracy(logits.view(-1, self.speech_token_size + 3), lm_target, ignore_label=IGNORE_ID)
+        acc = th_accuracy(logits.view(-1, self.speech_token_size + 200), lm_target, ignore_label=IGNORE_ID)
         return {'loss': loss, 'acc': acc}
+
 
     @torch.inference_mode()
     def inference(
