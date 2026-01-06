@@ -67,7 +67,8 @@ class CosyVoice3Embedding(nn.Module):
         """
         logging.info(f"Loading LLM from {llm_checkpoint_path}")
         
-        checkpoint = torch.load(llm_checkpoint_path, map_location='cpu')
+        # PyTorch 2.6+ requires weights_only=False for numpy types in checkpoints
+        checkpoint = torch.load(llm_checkpoint_path, map_location='cpu', weights_only=False)
         
         # Filter out non-LLM keys (epoch, step, optimizer, etc.)
         if isinstance(checkpoint, dict):

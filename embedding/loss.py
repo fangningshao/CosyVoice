@@ -29,15 +29,17 @@ class InfoNCELoss(nn.Module):
                  (exp(sim(query, positive) / tau) + sum(exp(sim(query, negative_i) / tau))) )
     """
     
-    def __init__(self, temperature: float = 0.07, use_hard_negatives: bool = True):
+    def __init__(self, temperature: float = 0.07, use_hard_negatives: bool = True, use_expanded_negatives: bool = True):
         """
         Args:
             temperature: Temperature parameter for scaling similarities
             use_hard_negatives: Whether to use hard negatives from data
+            use_expanded_negatives: Whether to use query-to-query and positive-to-positive as additional negatives (KaLM-style)
         """
         super().__init__()
         self.temperature = temperature
         self.use_hard_negatives = use_hard_negatives
+        self.use_expanded_negatives = use_expanded_negatives
     
     def forward(self, 
                 query_embeddings: torch.Tensor,
@@ -45,7 +47,7 @@ class InfoNCELoss(nn.Module):
                 negative_embeddings: Optional[torch.Tensor] = None,
                 negative_counts: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         """
-        Compute InfoNCE loss.
+        Compute InfoNCE loss with expanded negatives (KaLM-style).
         
         Args:
             query_embeddings: Query embeddings [batch, dim]
@@ -66,18 +68,42 @@ class InfoNCELoss(nn.Module):
         query_embeddings = F.normalize(query_embeddings, p=2, dim=-1)
         positive_embeddings = F.normalize(positive_embeddings, p=2, dim=-1)
         
-        # Compute similarity between query and positive
+        # Compute similarity between query and positive (in-batch)
         # [batch, batch] - diagonal contains query-positive similarities
-        pos_sim = torch.matmul(query_embeddings, positive_embeddings.T) / self.temperature
+        scores = torch.matmul(query_embeddings, positive_embeddings.T) / self.temperature
         
         # Create labels (diagonal elements are positives)
+        # For group_size=1 (one positive per query), labels are just [0, 1, 2, ..., batch-1]
         labels = torch.arange(batch_size, device=device)
         
-        # In-batch negatives: all other samples in the batch
-        logits = pos_sim
+        # Add expanded negatives (KaLM-style)
+        if self.use_expanded_negatives:
+            # Query-to-query similarities (all other queries as negatives)
+            scores_q_q = torch.matmul(query_embeddings, query_embeddings.T) / self.temperature
+            # Mask out diagonal (self-similarity)
+            scores_q_q = scores_q_q.masked_fill_(
+                torch.eye(batch_size, dtype=torch.bool, device=device),
+                torch.finfo(scores_q_q.dtype).min
+            )
+            
+            # Positive-to-positive similarities (all other positives as negatives)
+            scores_p_p = torch.matmul(positive_embeddings, positive_embeddings.T) / self.temperature
+            # Mask out diagonal (self-similarity)
+            scores_p_p = scores_p_p.masked_fill_(
+                torch.eye(batch_size, dtype=torch.bool, device=device),
+                torch.finfo(scores_p_p.dtype).min
+            )
+            
+            # Concatenate: [batch, batch + (batch-1) + (batch-1)]
+            # Shape: [batch, 3*batch - 2]
+            # Example with batch=3:
+            # scores = [[q0·p0, q0·p1, q0·p2, | q0·q1, q0·q2, | p0·p1, p0·p2],
+            #           [q1·p0, q1·p1, q1·p2, | q1·q0, q1·q2, | p1·p0, p1·p2],
+            #           [q2·p0, q2·p1, q2·p2, | q2·q0, q2·q1, | p2·p0, p2·p1]]
+            scores = torch.cat([scores, scores_q_q, scores_p_p], dim=-1)
         
-        # Compute softmax loss (in-batch negatives only)
-        softmax_loss = F.cross_entropy(logits, labels)
+        # Compute softmax loss (in-batch + expanded negatives)
+        softmax_loss = F.cross_entropy(scores, labels)
         
         # Initialize hard negative loss
         hard_negative_loss = torch.tensor(0.0, device=device)
@@ -113,17 +139,19 @@ class InfoNCELoss(nn.Module):
                 if max_neg_count > 0:
                     padded_neg_sims = torch.full(
                         (batch_size, max_neg_count), 
-                        float('-inf'), 
+                        torch.finfo(scores.dtype).min,  # Use min value instead of -inf
                         device=device
                     )
                     for i, ns in enumerate(neg_sims):
                         if len(ns) > 0:
                             padded_neg_sims[i, :len(ns)] = ns
                     
-                    # Concatenate with in-batch similarities for combined loss
-                    combined_logits = torch.cat([logits, padded_neg_sims], dim=1)
+                    # Concatenate with existing scores (in-batch + expanded + hard negatives)
+                    combined_logits = torch.cat([scores, padded_neg_sims], dim=1)
+
+                    # Final Shape: [batch, 3*batch - 2 + max_hard_negs]
                     
-                    # Compute combined loss (in-batch + hard negatives)
+                    # Compute combined loss
                     total_loss = F.cross_entropy(combined_logits, labels)
                     
                     # Hard negative loss = total - softmax
@@ -136,8 +164,8 @@ class InfoNCELoss(nn.Module):
                 # [batch, num_total_negatives]
                 neg_sim = torch.matmul(query_embeddings, negative_embeddings.T) / self.temperature
                 
-                # Concatenate with in-batch similarities
-                combined_logits = torch.cat([logits, neg_sim], dim=1)
+                # Concatenate with existing scores
+                combined_logits = torch.cat([scores, neg_sim], dim=1)
                 
                 # Compute combined loss
                 total_loss = F.cross_entropy(combined_logits, labels)

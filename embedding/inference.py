@@ -98,27 +98,42 @@ class CosyVoice3EmbeddingInference:
             speech_tokenizer_path=os.path.join(model_dir, 'speech_tokenizer_v3.onnx')
         )
         
-        # Load weights from checkpoint
+        # ====================================================================
+        # LOADING PROCEDURE (same as eval_checkpoint.py):
+        # 1. Load base LLM weights from llm.pt
+        # 2. Apply LoRA (if training checkpoint has LoRA)
+        # 3. Load LoRA weights from training checkpoint
+        # ====================================================================
+        
+        # STEP 1: Always load base LLM weights first
+        llm_path = self._find_llm_checkpoint()
+        logging.info("="*80)
+        logging.info("STEP 1: Loading base LLM weights")
+        logging.info("="*80)
+        logging.info(f"Loading from: {llm_path}")
+        self.model.load_llm(llm_path, strict=False)
+        logging.info("✓ Base LLM weights loaded successfully")
+        
+        # STEP 2 & 3: If training checkpoint provided, check if it has LoRA
         if checkpoint_path and os.path.exists(checkpoint_path):
-            # Check if it's a training checkpoint or base LLM checkpoint
             if self._is_training_checkpoint(checkpoint_path):
-                # Load from custom trained checkpoint
-                logging.info(f"Loading trained checkpoint from {checkpoint_path}")
+                logging.info("\n" + "="*80)
+                logging.info("STEP 2 & 3: Applying LoRA and loading trained weights")
+                logging.info("="*80)
+                logging.info(f"Loading trained checkpoint from: {checkpoint_path}")
                 self._load_trained_checkpoint(checkpoint_path)
             else:
-                # Load from base LLM checkpoint
-                logging.info(f"Loading base LLM checkpoint from {checkpoint_path}")
-                self.model.load_llm(checkpoint_path, strict=False)
+                # It's a base LLM checkpoint, but we already loaded base LLM above
+                logging.warning(f"Checkpoint {checkpoint_path} is a base LLM checkpoint, already loaded from {llm_path}")
         else:
-            # Load from base LLM checkpoint in model_dir
-            llm_path = self._find_llm_checkpoint()
-            logging.info(f"Loading base LLM checkpoint from {llm_path}")
-            self.model.load_llm(llm_path, strict=False)
+            logging.info("\n" + "="*80)
+            logging.info("No training checkpoint provided - using base LLM only")
+            logging.info("="*80)
         
         self.model.to(device)
         self.model.eval()
         
-        logging.info(f"✓ CosyVoice3EmbeddingInference initialized on {device}")
+        logging.info(f"\n✓ CosyVoice3EmbeddingInference initialized on {device}")
 
     def _is_training_checkpoint(self, checkpoint_path: str) -> bool:
         """
@@ -132,7 +147,8 @@ class CosyVoice3EmbeddingInference:
             True if training checkpoint, False if base LLM checkpoint
         """
         try:
-            checkpoint = torch.load(checkpoint_path, map_location='cpu')
+            # PyTorch 2.6+ requires weights_only=False for numpy types in checkpoints
+            checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
             
             # Training checkpoints have these keys
             training_keys = ['model_state_dict', 'optimizer_state_dict', 'scheduler_state_dict']
@@ -179,11 +195,12 @@ class CosyVoice3EmbeddingInference:
         - epoch: Training epoch
         - step: Training step
         - val_loss: Validation loss
+        - config: Training config including LoRA parameters
         """
         logging.info(f"Loading checkpoint: {checkpoint_path}")
         
-        # Load checkpoint
-        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        # Load checkpoint (PyTorch 2.6+ requires weights_only=False)
+        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
         
         # Log checkpoint info
         if 'epoch' in checkpoint:
@@ -193,7 +210,7 @@ class CosyVoice3EmbeddingInference:
         if 'val_loss' in checkpoint and checkpoint['val_loss'] is not None:
             logging.info(f"  Validation loss: {checkpoint['val_loss']:.4f}")
         
-        # Load model state dict
+        # Extract model state dict
         if 'model_state_dict' not in checkpoint:
             raise ValueError(
                 f"No 'model_state_dict' found in checkpoint {checkpoint_path}\n"
@@ -208,15 +225,162 @@ class CosyVoice3EmbeddingInference:
             logging.info("Removing 'module.' prefix from DDP checkpoint")
             state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
         
-        # Load weights
-        missing_keys, unexpected_keys = self.model.load_state_dict(state_dict, strict=False)
+        # Check for LoRA weights in checkpoint
+        lora_keys = [k for k in state_dict.keys() if 'lora_A' in k or 'lora_B' in k]
+        use_lora = len(lora_keys) > 0
         
-        if missing_keys:
-            logging.warning(f"Missing keys in checkpoint: {missing_keys}")
-        if unexpected_keys:
-            logging.warning(f"Unexpected keys in checkpoint: {unexpected_keys}")
-        
-        logging.info("✓ Checkpoint loaded successfully")
+        if use_lora:
+            logging.info("="*80)
+            logging.info("✓ Detected LoRA checkpoint")
+            logging.info("="*80)
+            
+            # Get LoRA config from checkpoint (preferred) or infer from weights
+            if 'config' in checkpoint and checkpoint['config']:
+                config = checkpoint['config']
+                lora_rank = config.get('lora_r', config.get('lora_rank', 8))
+                lora_alpha = config.get('lora_alpha', lora_rank * 2)
+                lora_dropout = config.get('lora_dropout', 0.1)
+                target_modules = config.get('target_modules', 
+                    ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj'])
+                logging.info("✓ Using LoRA config from checkpoint")
+            else:
+                # Infer from first lora_A weight
+                first_lora_a = [k for k in lora_keys if 'lora_A' in k][0]
+                lora_rank = state_dict[first_lora_a].shape[0]
+                lora_alpha = lora_rank * 2
+                lora_dropout = 0.1
+                target_modules = ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj']
+                logging.warning("⚠️  No config found in checkpoint, inferring LoRA parameters")
+            
+            logging.info(f"  LoRA rank: {lora_rank}")
+            logging.info(f"  LoRA alpha: {lora_alpha}")
+            logging.info(f"  LoRA dropout: {lora_dropout}")
+            logging.info(f"  Target modules: {target_modules}")
+            
+            # Apply LoRA to the LLM
+            from peft import LoraConfig, get_peft_model
+            
+            lora_config = LoraConfig(
+                r=lora_rank,
+                lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
+                target_modules=target_modules,
+                bias="none",
+                task_type="FEATURE_EXTRACTION"
+            )
+            
+            self.model.llm = get_peft_model(self.model.llm, lora_config)
+            logging.info("✓ LoRA applied to model")
+            
+            # ================================================================
+            # CRITICAL: Remap checkpoint keys to match PEFT structure
+            # ================================================================
+            # Training format:   llm.llm.model.model.layers.X.lora_A...
+            # After get_peft_model(): llm.base_model.model.llm.model.model.layers.X.lora_A...
+            
+            logging.info("\nRemapping checkpoint keys to match PEFT structure...")
+            
+            model_state = self.model.state_dict()
+            remapped_state = {}
+            unmapped_keys = []
+            
+            for ckpt_key, ckpt_value in state_dict.items():
+                # Try direct match first
+                if ckpt_key in model_state:
+                    remapped_state[ckpt_key] = ckpt_value
+                # Remap LoRA keys: llm.llm.* -> llm.base_model.model.llm.*
+                elif ckpt_key.startswith('llm.llm.'):
+                    new_key = ckpt_key.replace('llm.llm.', 'llm.base_model.model.llm.')
+                    if new_key in model_state:
+                        remapped_state[new_key] = ckpt_value
+                    else:
+                        unmapped_keys.append((ckpt_key, new_key))
+                else:
+                    # Non-LLM keys (llm_decoder, etc.) - keep as is
+                    if ckpt_key in model_state:
+                        remapped_state[ckpt_key] = ckpt_value
+                    else:
+                        unmapped_keys.append((ckpt_key, None))
+            
+            logging.info(f"  Remapped {len(remapped_state)} parameters")
+            if unmapped_keys:
+                logging.warning(f"  Could not remap {len(unmapped_keys)} keys")
+                for ckpt_key, new_key in unmapped_keys[:5]:
+                    logging.warning(f"    - {ckpt_key}")
+            
+            # Use remapped state
+            state_dict = remapped_state
+            
+            # ================================================================
+            # CRITICAL: Verify LoRA weights will be loaded
+            # ================================================================
+            checkpoint_keys = set(state_dict.keys())
+            model_keys = set(model_state.keys())
+            
+            matched_keys = checkpoint_keys & model_keys
+            missing_keys = model_keys - checkpoint_keys
+            
+            # Check for missing LoRA weights
+            missing_lora = [k for k in missing_keys if 'lora_' in k]
+            matched_lora = [k for k in matched_keys if 'lora_' in k]
+            
+            logging.info(f"\nLoRA Parameter Alignment:")
+            logging.info(f"  Total LoRA params in checkpoint: {len(lora_keys)}")
+            logging.info(f"  After remapping - matched: {len(matched_lora)}")
+            logging.info(f"  After remapping - missing: {len(missing_lora)}")
+            
+            if missing_lora:
+                logging.error("="*80)
+                logging.error("CRITICAL ERROR: LoRA weights missing after remapping!")
+                logging.error("="*80)
+                logging.error(f"Found {len(missing_lora)} LoRA parameters that would be randomly initialized:")
+                for i, key in enumerate(missing_lora[:10]):
+                    logging.error(f"  {i+1}. {key}")
+                if len(missing_lora) > 10:
+                    logging.error(f"  ... and {len(missing_lora) - 10} more")
+                logging.error("\nThis means inference would use UNTRAINED LoRA weights!")
+                logging.error("="*80)
+                raise ValueError(f"Cannot proceed: {len(missing_lora)} LoRA weights missing from checkpoint")
+            
+            # Load state dict
+            missing_keys, unexpected_keys = self.model.load_state_dict(state_dict, strict=False)
+            
+            # Verify no LoRA weights in missing_keys after load
+            missing_lora_after = [k for k in missing_keys if 'lora_' in k]
+            if missing_lora_after:
+                logging.error(f"❌ CRITICAL: {len(missing_lora_after)} LoRA weights still missing after load!")
+                raise ValueError(f"LoRA weights not properly loaded: {missing_lora_after[:5]}")
+            
+            # Count loaded LoRA parameters
+            loaded_lora = len(matched_lora)
+            logging.info(f"\n✓ Successfully loaded {loaded_lora} LoRA parameters")
+            
+            # Missing base weights are expected (loaded from base LLM)
+            missing_base = [k for k in missing_keys if 'lora_' not in k]
+            if missing_base:
+                logging.info(f"  {len(missing_base)} base weights missing (expected - using base LLM)")
+            
+            if unexpected_keys:
+                logging.warning(f"  {len(unexpected_keys)} unexpected keys in checkpoint")
+            
+            logging.info("="*80)
+            logging.info("✓ LoRA checkpoint loaded successfully!")
+            logging.info("="*80)
+        else:
+            # No LoRA - regular checkpoint
+            logging.info("Loading non-LoRA checkpoint...")
+            missing_keys, unexpected_keys = self.model.load_state_dict(state_dict, strict=False)
+            
+            if missing_keys:
+                logging.warning(f"Missing keys in checkpoint: {missing_keys[:10]}")
+                if len(missing_keys) > 10:
+                    logging.warning(f"  ... and {len(missing_keys) - 10} more")
+            if unexpected_keys:
+                logging.warning(f"Unexpected keys in checkpoint: {unexpected_keys[:10]}")
+                if len(unexpected_keys) > 10:
+                    logging.warning(f"  ... and {len(unexpected_keys) - 10} more")
+            
+            logging.info("✓ Checkpoint loaded successfully")
                     
     def encode_voice(self, 
                     instruction_text: str,

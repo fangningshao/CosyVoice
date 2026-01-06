@@ -21,6 +21,11 @@ from torch.utils.data import Dataset
 from typing import Dict, List, Optional
 import logging
 
+# Set offline mode BEFORE any CosyVoice imports to prevent network calls
+os.environ['MODELSCOPE_OFFLINE'] = '1'
+os.environ['TRANSFORMERS_OFFLINE'] = '1'
+os.environ['HF_HUB_OFFLINE'] = '1'
+
 from cosyvoice.cli.frontend import CosyVoiceFrontEnd
 from hyperpyyaml import load_hyperpyyaml
 
@@ -46,6 +51,11 @@ class VoiceEmbeddingDataset(Dataset):
     }
     """
     
+    # Class-level cache for frontends: {(model_dir, pid): frontend}
+    # Use PID only (not worker_id) to prevent re-initialization on validation/train switches
+    _frontend_cache = {}
+    _frontend_lock = {}  # Lock per PID to prevent concurrent initialization
+    
     def __init__(self,
                  data_list_file: str,
                  frontend: Optional[CosyVoiceFrontEnd] = None,
@@ -54,7 +64,8 @@ class VoiceEmbeddingDataset(Dataset):
                  use_hard_negatives: bool = True,
                  max_negatives: int = 7,
                  max_duration: float = 30.0,
-                 min_duration: float = 1.0):
+                 min_duration: float = 1.0,
+                 skip_prefilter: bool = True):
         """
         Args:
             data_list_file: Path to data list file (JSON lines)
@@ -65,6 +76,7 @@ class VoiceEmbeddingDataset(Dataset):
             max_negatives: Maximum number of hard negatives to use
             max_duration: Maximum audio duration in seconds (default 30s for CosyVoice)
             min_duration: Minimum audio duration in seconds
+            skip_prefilter: Skip duration/existence pre-filtering (default True, assumes files already filtered)
         """
         self.data_list_file = data_list_file
         self.sample_rate = sample_rate
@@ -72,17 +84,11 @@ class VoiceEmbeddingDataset(Dataset):
         self.max_negatives = max_negatives
         self.max_duration = max_duration
         self.min_duration = min_duration
+        self.skip_prefilter = skip_prefilter
         
-        # Store model_dir for lazy initialization
+        # Store model_dir and config path for lazy initialization
         self.model_dir = model_dir
-        
-        # Don't store frontend directly (not pickle-friendly)
-        # Store config path instead
         self.config_path = os.path.join(model_dir, 'cosyvoice3.yaml') if model_dir else None
-        
-        # These will be lazily initialized per worker
-        self._frontend = None
-        self._configs = None
         
         # Load data list
         self.data = []
@@ -97,9 +103,12 @@ class VoiceEmbeddingDataset(Dataset):
         
         logging.info(f"Loaded {len(self.data)} samples from {data_list_file}")
         
-        # Pre-filter invalid samples
+        # Pre-filter invalid samples (skip if already filtered)
         self.valid_indices = list(range(len(self.data)))
-        self._prefilter_samples()
+        if not self.skip_prefilter:
+            self._prefilter_samples()
+        else:
+            logging.info("Pre-filtering skipped (assuming files already filtered with filter_jsonl_by_audio.py)")
     
     def _check_audio_duration(self, audio_path: str) -> Optional[float]:
         """
@@ -226,28 +235,56 @@ class VoiceEmbeddingDataset(Dataset):
     
     @property
     def frontend(self):
-        """Lazy load frontend per worker (pickle-friendly)."""
-        if self._frontend is None:
+        """Lazy load frontend per process (not per worker) to avoid re-initialization."""
+        import threading
+        
+        # Use PID only as cache key (persistent across worker switches)
+        current_pid = os.getpid()
+        cache_key = (self.model_dir, current_pid)
+        
+        # Check if frontend already exists for this process
+        if cache_key in self._frontend_cache:
+            return self._frontend_cache[cache_key]
+        
+        # Create lock for this PID if doesn't exist
+        if cache_key not in self._frontend_lock:
+            self._frontend_lock[cache_key] = threading.Lock()
+        
+        # Acquire lock to prevent concurrent initialization
+        with self._frontend_lock[cache_key]:
+            # Double-check after acquiring lock (another thread may have initialized)
+            if cache_key in self._frontend_cache:
+                return self._frontend_cache[cache_key]
+            
             if self.config_path is None or not os.path.exists(self.config_path):
                 raise ValueError(f"Config path not found: {self.config_path}")
             
-            # Load config
-            with open(self.config_path, 'r', encoding='utf-8') as f:
-                self._configs = load_hyperpyyaml(f)
+            # Get worker info for logging
+            worker_info = torch.utils.data.get_worker_info()
+            worker_id = worker_info.id if worker_info is not None else -1
             
-            # Initialize frontend
-            self._frontend = CosyVoiceFrontEnd(
-                self._configs['get_tokenizer'],
-                self._configs['feat_extractor'],
+            logging.info(f"Initializing frontend for worker {worker_id} (PID: {current_pid}) - ONCE per process")
+            
+            # Load config only once per process
+            with open(self.config_path, 'r', encoding='utf-8') as f:
+                configs = load_hyperpyyaml(f)
+            
+            # Initialize frontend (uses local files, no network calls)
+            frontend = CosyVoiceFrontEnd(
+                configs['get_tokenizer'],
+                configs['feat_extractor'],
                 os.path.join(self.model_dir, 'campplus.onnx'),
                 os.path.join(self.model_dir, 'speech_tokenizer_v3.onnx'),
                 os.path.join(self.model_dir, 'spk2info.pt'),
-                self._configs['allowed_special']
+                configs['allowed_special']
             )
             
-            logging.info(f"Frontend initialized for worker process (PID: {os.getpid()})")
+            # Cache the frontend for this process
+            self._frontend_cache[cache_key] = frontend
+            
+            logging.info(f"✓ Frontend cached for PID {current_pid} (will be reused)")
         
-        return self._frontend
+        return self._frontend_cache[cache_key]
     
     def __len__(self):
         return len(self.valid_indices)
@@ -255,15 +292,11 @@ class VoiceEmbeddingDataset(Dataset):
     def __getstate__(self):
         """Custom pickle support - exclude non-picklable objects."""
         state = self.__dict__.copy()
-        # Remove non-picklable frontend and configs
-        state['_frontend'] = None
-        state['_configs'] = None
         return state
     
     def __setstate__(self, state):
         """Custom unpickle support - restore state."""
         self.__dict__.update(state)
-        # Frontend will be lazily re-initialized when accessed
     
     def load_audio(self, audio_path: str) -> torch.Tensor:
         """Load and preprocess audio file."""
@@ -309,6 +342,32 @@ class VoiceEmbeddingDataset(Dataset):
         except Exception as e:
             raise Exception(f"Error tokenizing speech {audio_path}: {e}")
     
+    def extract_instruction_prefix(self, query_text: str) -> str:
+        """
+        Extract instruction prefix from query text for text2speech retrieval.
+        
+        For text2speech tasks, if query contains "content:" substring,
+        return a homogeneous instruction prefix for better audio feature extraction.
+        
+        Examples:
+            "Retrieve the voice with the following content: 这是文本" 
+            "Retrieve the voice that contains the following content: 部分文本"
+            "Retrieve the voice that ends with the following content: 结尾文本"
+            -> "Retrieve the voice with the following content"
+        
+        Args:
+            query_text: Full query text
+            
+        Returns:
+            Instruction prefix (for positive/negative text alignment)
+        """
+        # Check if this is a text2speech query with "content:" marker
+        if "content:" in query_text.lower():
+            return "Retrieve the voice with the following content"
+        
+        # Fallback: return full query text
+        return query_text
+    
     def __getitem__(self, idx: int) -> Optional[Dict[str, torch.Tensor]]:
         """
         Get a training sample.
@@ -327,7 +386,7 @@ class VoiceEmbeddingDataset(Dataset):
                 query_instruction = item['query_text']
                 query_audio = item['query_wav']
                 positive_audio = item['pos_wav']
-                negative_audios = item.get('neg_wavs', [])
+                negative_audios = item.get('neg_wavs', []) if self.use_hard_negatives else []
                 
             elif 'query' in item and 'pos' in item:
                 # KaLM format
@@ -339,28 +398,33 @@ class VoiceEmbeddingDataset(Dataset):
                     query_audio = None  # Query is text-only
                 
                 positive_audio = item['pos'][0] if isinstance(item['pos'], list) else item['pos']
-                negative_audios = item.get('neg', [])
+                negative_audios = item.get('neg', []) if self.use_hard_negatives else []
                 
             else:
                 # Old format - for backward compatibility
                 query_audio = item['query']
                 query_instruction = item.get('query_instruction', 'Retrieve semantically similar voice')
                 positive_audio = item['positive']
-                negative_audios = item.get('negatives', [])
+                negative_audios = item.get('negatives', []) if self.use_hard_negatives else []
             
-            # Tokenize query instruction text
+            # Extract instruction prefix for positive/negative alignment
+            # For text2speech tasks, this extracts "Retrieve the voice with the following content:"
+            pos_neg_instruction = self.extract_instruction_prefix(query_instruction)
+            
+            # Tokenize query instruction text (full query)
             query_text_token, query_text_token_len = self.tokenize_text(query_instruction)
             
-            # Tokenize query audio (if exists)
-            if query_audio and os.path.exists(query_audio):
+            # Tokenize query audio (if exists and not null)
+            if query_audio and query_audio != "null" and os.path.exists(query_audio):
                 query_speech_token, query_speech_token_len = self.tokenize_speech(query_audio)
             else:
-                # No query audio, use empty tensor
+                # No query audio, use empty tensor (text-only query)
                 query_speech_token = torch.tensor([], dtype=torch.long)
                 query_speech_token_len = torch.tensor(0, dtype=torch.long)
             
             # Tokenize positive audio
-            positive_text_token, positive_text_token_len = self.tokenize_text(query_instruction)
+            # Use instruction prefix for text alignment (not full query)
+            positive_text_token, positive_text_token_len = self.tokenize_text(pos_neg_instruction)
             positive_speech_token, positive_speech_token_len = self.tokenize_speech(positive_audio)
             
             result = {
@@ -374,7 +438,8 @@ class VoiceEmbeddingDataset(Dataset):
                 'positive_speech_token_len': positive_speech_token_len,
             }
             
-            # Add hard negatives if available and enabled
+            # Add hard negatives ONLY if use_hard_negatives is True and negatives are available
+            # When use_hard_negatives is False, skip all negative audio loading (saves disk I/O)
             if self.use_hard_negatives and negative_audios:
                 # Sample up to max_negatives
                 num_negatives = min(len(negative_audios), self.max_negatives)
@@ -387,7 +452,8 @@ class VoiceEmbeddingDataset(Dataset):
                 
                 for neg_audio in sampled_negatives:
                     try:
-                        neg_text_token, neg_text_token_len = self.tokenize_text(query_instruction)
+                        # Use instruction prefix for negative text alignment (not full query)
+                        neg_text_token, neg_text_token_len = self.tokenize_text(pos_neg_instruction)
                         neg_speech_token, neg_speech_token_len = self.tokenize_speech(neg_audio)
                         
                         neg_text_tokens.append(neg_text_token)
@@ -408,9 +474,10 @@ class VoiceEmbeddingDataset(Dataset):
             
         except Exception as e:
             logging.error(f"Error processing sample {idx} (real_idx={real_idx}): {e}")
-            if query_audio:
+            if 'query_audio' in locals() and query_audio:
                 logging.error(f"  Query audio: {query_audio}")
-            logging.error(f"  Positive audio: {positive_audio}")
+            if 'positive_audio' in locals():
+                logging.error(f"  Positive audio: {positive_audio}")
             
             # Return None to be filtered out by collate_fn
             return None
