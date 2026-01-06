@@ -768,6 +768,22 @@ def validate(model, val_loader, criterion, device, use_mixed_precision, rank=0, 
             num_batches += 1
             
             pbar.set_postfix({'val_loss': f"{loss_dict['total_loss'].item():.4f}", 'batch': f"{batch_idx+1}/{max_batches}"})
+
+            # Free memory IMMEDIATELY after loss calculation
+            del query_embeddings, positive_embeddings
+            if negative_embeddings is not None:
+                del negative_embeddings
+            del query_output, positive_output
+            if 'negative_output' in locals():
+                del negative_output
+            
+            # Free loss_dict tensors
+            if isinstance(loss_dict, dict):
+                for k, v in loss_dict.items():
+                    if torch.is_tensor(v):
+                        del loss_dict[k]
+            
+            torch.cuda.empty_cache()  # Force memory cleanup
     
     # Calculate average losses
     avg_total_loss = total_loss / num_batches if num_batches > 0 else 0
@@ -944,21 +960,53 @@ def main():
             lora_dropout=args.lora_dropout,
             target_modules=target_modules,
             bias="none",
-            task_type="FEATURE_EXTRACTION"  # Use FEATURE_EXTRACTION for embedding models
+            task_type="FEATURE_EXTRACTION",  # Use FEATURE_EXTRACTION for embedding models
+            # IMPORTANT: Disable gradient checkpointing for LoRA
+            inference_mode=False,  # Must be False for training
         )
         
         # Apply LoRA to the LLM part of the model
         model.llm = get_peft_model(model.llm, lora_config)
-        
+
+        # Explicitly verify that base model parameters are frozen
+        if rank == 0:
+            logger.info("Verifying parameter freezing...")
+            trainable_params = 0
+            frozen_params = 0
+            for name, param in model.named_parameters():
+                if param.requires_grad:
+                    trainable_params += param.numel()
+                else:
+                    frozen_params += param.numel()
+            
+            total_params = trainable_params + frozen_params
+            logger.info(f"  Trainable parameters: {trainable_params:,} ({trainable_params/total_params*100:.2f}%)")
+            logger.info(f"  Frozen parameters: {frozen_params:,} ({frozen_params/total_params*100:.2f}%)")
+            
+            # Verify no base_layer parameters are trainable
+            trainable_base = [n for n, p in model.named_parameters() if p.requires_grad and 'base_layer' in n]
+            if trainable_base:
+                logger.error(f"❌ ERROR: {len(trainable_base)} base_layer parameters are trainable!")
+                logger.error(f"  This will consume unnecessary memory. Examples:")
+                for name in trainable_base[:5]:
+                    logger.error(f"    - {name}")
+                raise ValueError("Base model parameters should be frozen with LoRA!")
+
+        # Explicitly disable gradient checkpointing for LoRA training
+        if hasattr(model.llm, 'gradient_checkpointing_disable'):
+            model.llm.gradient_checkpointing_disable()
+
         if rank == 0:
             logger.info("LoRA applied successfully!")
             model.llm.print_trainable_parameters()
     
-    # Enable gradient checkpointing for memory savings
-    if hasattr(model.llm, 'gradient_checkpointing_enable'):
+    # Enable gradient checkpointing ONLY if not using LoRA
+    if not args.use_lora and hasattr(model.llm, 'gradient_checkpointing_enable'):
         model.llm.gradient_checkpointing_enable()
         if rank == 0:
             logger.info("Gradient checkpointing enabled")
+    elif args.use_lora and rank == 0:
+        logger.info("Gradient checkpointing disabled (not needed with LoRA)")
     
     model.to(device)
     
@@ -972,9 +1020,14 @@ def main():
     else:
         criterion = MultiTaskContrastiveLoss(temperature=args.temperature, use_hard_negatives=args.use_hard_negatives)    
 
-    # Initialize optimizer
+    # Initialize optimizer - ONLY for trainable parameters
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    
+    if rank == 0:
+        logger.info(f"Initializing optimizer for {len(trainable_params)} parameter tensors")
+    
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        trainable_params,  # Only trainable parameters
         lr=args.learning_rate,
         weight_decay=0.01
     )
