@@ -278,21 +278,217 @@ def save_checkpoint(model, optimizer, scheduler, epoch, step, output_dir, rank=0
     logging.info(f"Checkpoint saved: {checkpoint_path}")
 
 
-def load_checkpoint(checkpoint_path, model, optimizer, scheduler):
-    """Load training checkpoint."""
-    checkpoint = torch.load(checkpoint_path)
+def load_checkpoint(checkpoint_path, model, optimizer, scheduler, use_lora=False):
+    """
+    Load training checkpoint.
+    
+    When use_lora=True, the checkpoint contains only LoRA weights (not the full LLM).
+    The base LLM should already be loaded before calling this function.
+    This function validates that all checkpoint weights can be mapped correctly
+    and breaks early if there's any mismatch.
+    
+    Args:
+        checkpoint_path: Path to the checkpoint file
+        model: The model (may be wrapped in DDP)
+        optimizer: The optimizer
+        scheduler: The learning rate scheduler
+        use_lora: Whether LoRA was used for training (must match checkpoint)
+    
+    Returns:
+        tuple: (epoch, step) from the checkpoint
+    
+    Raises:
+        RuntimeError: If checkpoint weights don't match model architecture
+    """
+    logging.info(f"Loading checkpoint from: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location='cpu')
     
     # Unwrap DDP if needed
     model_to_load = model.module if hasattr(model, 'module') else model
-    model_to_load.load_state_dict(checkpoint['model_state_dict'])
     
+    # Check if checkpoint was saved with LoRA
+    checkpoint_use_lora = checkpoint.get('use_lora', False)
+    
+    if checkpoint_use_lora != use_lora:
+        raise RuntimeError(
+            f"Checkpoint LoRA setting mismatch! "
+            f"Checkpoint was saved with use_lora={checkpoint_use_lora}, "
+            f"but current training has use_lora={use_lora}. "
+            f"These must match for correct weight loading."
+        )
+    
+    # Get checkpoint state dict
+    checkpoint_state_dict = checkpoint['model_state_dict']
+    
+    # Print all checkpoint keys for debugging
+    logging.info(f"=" * 80)
+    logging.info(f"CHECKPOINT KEYS ({len(checkpoint_state_dict)} total):")
+    logging.info(f"=" * 80)
+    for i, key in enumerate(sorted(checkpoint_state_dict.keys())):
+        logging.info(f"  [{i:3d}] {key} -> shape: {checkpoint_state_dict[key].shape}")
+    logging.info(f"=" * 80)
+    
+    if use_lora:
+        # LoRA checkpoint: contains only LoRA weights and non-LLM components
+        # The base LLM is already loaded, we just need to load the LoRA adapters
+        logging.info("Loading LoRA checkpoint (base LLM already loaded)...")
+        logging.info(f"  Checkpoint contains {len(checkpoint_state_dict)} parameter tensors")
+        
+        # Get current model state dict for comparison
+        current_state_dict = model_to_load.state_dict()
+        
+        # Print model keys for debugging (only LoRA keys)
+        logging.info(f"=" * 80)
+        logging.info(f"MODEL LORA KEYS (filtered from {len(current_state_dict)} total):")
+        logging.info(f"=" * 80)
+        lora_model_keys = [k for k in sorted(current_state_dict.keys()) if 'lora_' in k]
+        for i, key in enumerate(lora_model_keys[:20]):  # Show first 20
+            logging.info(f"  [{i:3d}] {key} -> shape: {current_state_dict[key].shape}")
+        if len(lora_model_keys) > 20:
+            logging.info(f"  ... and {len(lora_model_keys) - 20} more LoRA keys")
+        logging.info(f"=" * 80)
+        
+        # Validate checkpoint keys exist in model and have matching shapes
+        missing_in_model = []
+        shape_mismatches = []
+        loaded_keys = []
+        
+        for ckpt_key, ckpt_value in checkpoint_state_dict.items():
+            # Try to find matching key in current model
+            # The checkpoint keys were saved with cleaned names:
+            #   llm.base_model.model.model.layers.X... -> llm.model.layers.X...
+            # But the actual model has the PEFT wrapper, so we need to map back:
+            #   llm.model.layers.X... -> llm.base_model.model.model.layers.X...
+            
+            # Try direct match first
+            if ckpt_key in current_state_dict:
+                model_key = ckpt_key
+            else:
+                # Try adding back the PEFT wrapper prefix for LLM LoRA weights
+                if ckpt_key.startswith('llm.') and 'lora_' in ckpt_key:
+                    # The checkpoint saved: llm.base_model.model. -> llm.
+                    # So we need to restore: llm. -> llm.base_model.model.
+                    # Example:
+                    #   Checkpoint: llm.model.layers.0.self_attn.q_proj.lora_A.default.weight
+                    #   Model:      llm.base_model.model.model.layers.0.self_attn.q_proj.lora_A.default.weight
+                    peft_key = ckpt_key.replace('llm.', 'llm.base_model.model.', 1)  # Only replace first occurrence
+                    if peft_key in current_state_dict:
+                        model_key = peft_key
+                    else:
+                        missing_in_model.append((ckpt_key, f"tried: {peft_key}"))
+                        continue
+                else:
+                    missing_in_model.append((ckpt_key, "no mapping attempted"))
+                    continue
+            
+            # Check shape match
+            if current_state_dict[model_key].shape != ckpt_value.shape:
+                shape_mismatches.append(
+                    f"  {ckpt_key}: checkpoint {ckpt_value.shape} vs model {current_state_dict[model_key].shape}"
+                )
+            else:
+                loaded_keys.append((ckpt_key, model_key))
+        
+        # Report and fail on mismatches
+        if missing_in_model:
+            logging.error(f"✗ {len(missing_in_model)} checkpoint keys not found in model:")
+            for key, reason in missing_in_model[:10]:  # Show first 10
+                logging.error(f"    {key} ({reason})")
+            if len(missing_in_model) > 10:
+                logging.error(f"    ... and {len(missing_in_model) - 10} more")
+        
+        if shape_mismatches:
+            logging.error(f"✗ {len(shape_mismatches)} shape mismatches:")
+            for msg in shape_mismatches[:10]:  # Show first 10
+                logging.error(msg)
+            if len(shape_mismatches) > 10:
+                logging.error(f"    ... and {len(shape_mismatches) - 10} more")
+        
+        if missing_in_model or shape_mismatches:
+            raise RuntimeError(
+                f"Checkpoint weight mismatch! "
+                f"{len(missing_in_model)} keys missing in model, "
+                f"{len(shape_mismatches)} shape mismatches. "
+                f"Cannot proceed with uninitialized/mismatched weights. "
+                f"Check that model architecture matches the checkpoint."
+            )
+        
+        # All validations passed, now load the weights
+        logging.info(f"@ All {len(loaded_keys)} checkpoint weights validated successfully")
+        
+        # Create a new state dict with properly mapped keys
+        mapped_state_dict = {}
+        for ckpt_key, model_key in loaded_keys:
+            mapped_state_dict[model_key] = checkpoint_state_dict[ckpt_key]
+        
+        # Load with strict=False since we're only loading a subset (LoRA weights)
+        # But we've already validated all keys, so this should work
+        load_result = model_to_load.load_state_dict(mapped_state_dict, strict=False)
+        
+        # Check for unexpected issues
+        if load_result.unexpected_keys:
+            logging.warning(f"Unexpected keys during load (should not happen): {load_result.unexpected_keys[:5]}")
+        
+        logging.info(f"@ LoRA weights loaded successfully!")
+        logging.info(f"  Loaded {len(loaded_keys)} LoRA parameter tensors")
+        
+    else:
+        # Full model checkpoint: load everything
+        logging.info("Loading full model checkpoint...")
+        
+        # Validate all keys exist and shapes match
+        current_state_dict = model_to_load.state_dict()
+        
+        missing_in_checkpoint = set(current_state_dict.keys()) - set(checkpoint_state_dict.keys())
+        missing_in_model = set(checkpoint_state_dict.keys()) - set(current_state_dict.keys())
+        
+        shape_mismatches = []
+        for key in checkpoint_state_dict.keys():
+            if key in current_state_dict:
+                if checkpoint_state_dict[key].shape != current_state_dict[key].shape:
+                    shape_mismatches.append(
+                        f"  {key}: checkpoint {checkpoint_state_dict[key].shape} vs model {current_state_dict[key].shape}"
+                    )
+        
+        if missing_in_model:
+            logging.warning(f"⚠️  {len(missing_in_model)} checkpoint keys not in model (will be ignored):")
+            for key in list(missing_in_model)[:5]:
+                logging.warning(f"    {key}")
+        
+        if missing_in_checkpoint:
+            logging.error(f"✗ {len(missing_in_checkpoint)} model keys not in checkpoint:")
+            for key in list(missing_in_checkpoint)[:10]:
+                logging.error(f"    {key}")
+        
+        if shape_mismatches:
+            logging.error(f"✗ {len(shape_mismatches)} shape mismatches:")
+            for msg in shape_mismatches[:10]:
+                logging.error(msg)
+        
+        if shape_mismatches or (missing_in_checkpoint and len(missing_in_checkpoint) > 0):
+            raise RuntimeError(
+                f"Checkpoint weight mismatch! "
+                f"{len(missing_in_checkpoint)} keys missing in checkpoint, "
+                f"{len(shape_mismatches)} shape mismatches. "
+                f"Cannot proceed with uninitialized/mismatched weights."
+            )
+        
+        # Load weights
+        model_to_load.load_state_dict(checkpoint_state_dict, strict=False)
+        logging.info(f"@ Full model weights loaded successfully!")
+    
+    # Load optimizer and scheduler states
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
     
     epoch = checkpoint['epoch']
     step = checkpoint['step']
+    val_loss = checkpoint.get('val_loss', None)
     
-    logging.info(f"Checkpoint loaded: epoch {epoch}, step {step}")
+    logging.info(f"@ Checkpoint loaded: epoch {epoch}, step {step}")
+    if val_loss is not None:
+        logging.info(f"  Validation loss at checkpoint: {val_loss:.4f}")
+    
     return epoch, step
 
 
@@ -486,6 +682,8 @@ def train_epoch(model, train_loader, criterion, optimizer, scheduler, scaler, de
                 writer.add_scalar('train/loss', loss_dict['total_loss'].item(), global_step)
                 writer.add_scalar('train/softmax_loss', loss_dict.get('softmax_loss', 0), global_step)
                 writer.add_scalar('train/hard_negative_loss', loss_dict.get('hard_negative_loss', 0), global_step)
+                writer.add_scalar('train/accuracy', loss_dict.get('accuracy', 0), global_step)
+                writer.add_scalar('train/mean_rank', loss_dict.get('mean_rank', 0), global_step)
                 writer.add_scalar('train/learning_rate', current_lr, global_step)
                 
                 # Log gradient norm
@@ -780,6 +978,8 @@ def validate(model, val_loader, criterion, device, use_mixed_precision, rank=0, 
         writer.add_scalar('val/loss', avg_total_loss, global_step)
         writer.add_scalar('val/softmax_loss', avg_softmax_loss, global_step)
         writer.add_scalar('val/hard_negative_loss', avg_hard_neg_loss, global_step)
+        writer.add_scalar('val/accuracy', loss_dict.get('accuracy', 0), global_step)
+        writer.add_scalar('val/mean_rank', loss_dict.get('mean_rank', 0), global_step)
         
         # Log task-specific losses
         for task_type, task_loss in avg_task_losses.items():
@@ -1057,7 +1257,7 @@ def main():
     start_epoch = 0
     start_step = 0
     if args.resume_checkpoint:
-        start_epoch, start_step = load_checkpoint(args.resume_checkpoint, model, optimizer, scheduler)
+        start_epoch, start_step = load_checkpoint(args.resume_checkpoint, model, optimizer, scheduler, use_lora=args.use_lora)
     
     if rank == 0:
         logger.info(f"Total training steps: {total_steps}")

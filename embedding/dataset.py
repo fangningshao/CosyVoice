@@ -36,18 +36,10 @@ class VoiceEmbeddingDataset(Dataset):
     
     Expected data format (JSON lines):
     {
-        "query": "path/to/query_audio.wav",
-        "query_instruction": "Retrieve semantically similar voice",
-        "positive": "path/to/positive_audio.wav",
-        "positive_instruction": "Retrieve semantically similar voice",
-        "negatives": ["path/to/neg1.wav", "path/to/neg2.wav", ...]  # Optional
-    }
-    
-    Or from KaLM dataset format:
-    {
-        "query": "text instruction",
-        "pos": ["audio1.wav"],
-        "neg": ["audio2.wav", "audio3.wav"]
+        "query_text": "Retrieve semantically similar voice",
+        "query_wav": "path/to/query_audio.wav",
+        "pos_wav": "path/to/positive_audio.wav",        
+        "neg_wavs": ["path/to/neg1.wav", "path/to/neg2.wav", ...]  # Optional and variable length
     }
     """
     

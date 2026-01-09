@@ -403,7 +403,7 @@ def main():
                        help='Use only in-batch negatives (ignore hard negatives)')
     
     # LoRA settings
-    parser.add_argument('--use_lora', action='store_true',
+    parser.add_argument('--use_lora', action='store_true', default=True,
                        help='Whether checkpoint uses LoRA')
     parser.add_argument('--lora_r', type=int, default=8,
                        help='LoRA rank (default: 8)')

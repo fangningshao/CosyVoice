@@ -60,6 +60,8 @@ class InfoNCELoss(nn.Module):
                 - 'total_loss': Total loss
                 - 'softmax_loss': Loss from in-batch negatives
                 - 'hard_negative_loss': Loss from hard negatives (if provided)
+                - 'accuracy': Accuracy @1 (positive retrieved first)
+                - 'mean_rank': Mean rank of positive among all candidates
         """
         batch_size = query_embeddings.size(0)
         device = query_embeddings.device
@@ -103,10 +105,13 @@ class InfoNCELoss(nn.Module):
             scores = torch.cat([scores, scores_q_q, scores_p_p], dim=-1)
         
         # Compute softmax loss (in-batch + expanded negatives)
-        softmax_loss = F.cross_entropy(scores, labels)
+        softmax_loss = F.cross_entropy(scores, labels, reduction='mean')
         
         # Initialize hard negative loss
         hard_negative_loss = torch.tensor(0.0, device=device)
+        
+        # Track final logits for accuracy/mean_rank computation
+        final_logits = scores
         
         # Add hard negatives if provided
         if negative_embeddings is not None and self.use_hard_negatives and negative_embeddings.size(0) > 0:
@@ -152,10 +157,13 @@ class InfoNCELoss(nn.Module):
                     # Final Shape: [batch, 3*batch - 2 + max_hard_negs]
                     
                     # Compute combined loss
-                    total_loss = F.cross_entropy(combined_logits, labels)
+                    total_loss = F.cross_entropy(combined_logits, labels, reduction='mean')
                     
                     # Hard negative loss = total - softmax
                     hard_negative_loss = total_loss - softmax_loss
+                    
+                    # Update final logits for metrics
+                    final_logits = combined_logits
                 else:
                     total_loss = softmax_loss
             else:
@@ -168,17 +176,45 @@ class InfoNCELoss(nn.Module):
                 combined_logits = torch.cat([scores, neg_sim], dim=1)
                 
                 # Compute combined loss
-                total_loss = F.cross_entropy(combined_logits, labels)
+                total_loss = F.cross_entropy(combined_logits, labels, reduction='mean')
                 
                 # Hard negative loss = total - softmax
                 hard_negative_loss = total_loss - softmax_loss
+                
+                # Update final logits for metrics
+                final_logits = combined_logits
         else:
             total_loss = softmax_loss
+        
+        # Compute accuracy@1 and mean_rank
+        # final_logits: [batch, num_candidates] where labels[i] is the index of positive for query i
+        with torch.no_grad():
+            # Get predictions (index of max score for each query)
+            predictions = final_logits.argmax(dim=-1)  # [batch]
+            
+            # Accuracy@1: fraction where predicted index equals label (positive index)
+            accuracy = (predictions == labels).float().mean().item()
+            
+            # Mean rank: rank of positive among all candidates (1-indexed)
+            # Sort scores in descending order and find position of positive
+            sorted_indices = final_logits.argsort(dim=-1, descending=True)  # [batch, num_candidates]
+            
+            # For each query, find the rank of its positive (label)
+            ranks = []
+            for i in range(batch_size):
+                # Find position of labels[i] in sorted_indices[i]
+                # rank is 1-indexed (rank 1 = retrieved first)
+                rank = (sorted_indices[i] == labels[i]).nonzero(as_tuple=True)[0].item() + 1
+                ranks.append(rank)
+            
+            mean_rank = sum(ranks) / len(ranks)
         
         return {
             'total_loss': total_loss,
             'softmax_loss': softmax_loss.item(),
-            'hard_negative_loss': hard_negative_loss.item() if isinstance(hard_negative_loss, torch.Tensor) else hard_negative_loss
+            'hard_negative_loss': hard_negative_loss.item() if isinstance(hard_negative_loss, torch.Tensor) else hard_negative_loss,
+            'accuracy': accuracy,
+            'mean_rank': mean_rank
         }
 
 
