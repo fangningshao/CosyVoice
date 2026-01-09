@@ -511,26 +511,36 @@ def validate_step(model, dataloader, criterion, device, epoch, writer, global_st
             else:
                 neg_sim = 0.0
 
+            # Accumulate metrics
             total_loss += loss.item()
             total_softmax_loss += loss_dict['softmax_loss']
             total_hard_neg_loss += loss_dict['hard_negative_loss']
             total_pos_sim += pos_sim
             total_neg_sim += neg_sim
-            total_accuracy += loss_dict.get('accuracy', 0)
-            total_mean_rank += loss_dict.get('mean_rank', 0)
-            num_batches += 1
+            total_accuracy += loss_dict.get('accuracy', 0) * batch_size  # Weighted by batch size
+            total_mean_rank += loss_dict.get('mean_rank', 0) * batch_size  # Weighted by batch size
+            num_batches += batch_size
 
+            # Log intermediate metrics to TensorBoard
+            writer.add_scalar('Validation/Loss', loss.item(), global_step)
+            writer.add_scalar('Validation/Positive_Similarity', pos_sim, global_step)
+            writer.add_scalar('Validation/Negative_Similarity', neg_sim, global_step)
+            writer.add_scalar('Validation/Accuracy', loss_dict.get('accuracy', 0), global_step)
+            writer.add_scalar('Validation/Mean_Rank', loss_dict.get('mean_rank', 0), global_step)
+            global_step += 1
+
+    # Compute averaged metrics
     metrics = {
         'total_loss': total_loss / num_batches,
         'softmax_loss': total_softmax_loss / num_batches,
         'hard_negative_loss': total_hard_neg_loss / num_batches,
         'pos_sim': total_pos_sim / num_batches,
         'neg_sim': total_neg_sim / num_batches,
-        'accuracy': total_accuracy / num_batches,
-        'mean_rank': total_mean_rank / num_batches
+        'accuracy': total_accuracy / num_batches,  # Average accuracy
+        'mean_rank': total_mean_rank / num_batches  # Average mean rank
     }
 
-    return metrics['total_loss'], metrics
+    return metrics['total_loss'], metrics, global_step
 
 
 def validate(model, dataloader, criterion, device, epoch, writer, global_step):
@@ -717,6 +727,9 @@ def main():
                        help='Whether query includes audio')
     parser.add_argument('--random_seed', type=int, default=42,
                        help='Random seed for dataset')
+    parser.add_argument('--path_mapping', type=str, action='append', default=None,
+                       help='Path mapping in format "from_path::to_path" (e.g., "D:\\data\\::/workspace/data/"). '
+                            'Can be specified multiple times. All backslashes will be converted to forward slashes.')
 
     # System
     parser.add_argument('--num_workers', type=int, default=4,
@@ -754,6 +767,19 @@ def main():
 
     # Create datasets
     logger.info("Creating datasets...")
+    
+    # Parse path mappings from command-line arguments
+    path_mappings = []
+    if args.path_mapping:
+        logger.info("Path mappings configured:")
+        for mapping in args.path_mapping:
+            if '::' in mapping:
+                from_path, to_path = mapping.split('::', 1)
+                path_mappings.append((from_path, to_path))
+                logger.info(f"  '{from_path}' -> '{to_path}'")
+            else:
+                logger.warning(f"Invalid path mapping format (expected 'from::to'): {mapping}")
+    
     train_dataset = OmniEmbeddingDataset(
         data_list_file=args.train_data,
         model_dir=args.model_path,
@@ -763,7 +789,8 @@ def main():
         min_duration=args.min_duration,
         skip_prefilter=args.skip_prefilter,
         use_audio_in_query=args.use_audio_in_query,
-        random_seed=args.random_seed
+        random_seed=args.random_seed,
+        path_mappings=path_mappings
     )
 
     train_loader = DataLoader(
@@ -787,7 +814,8 @@ def main():
             min_duration=args.min_duration,
             skip_prefilter=args.skip_prefilter,
             use_audio_in_query=args.use_audio_in_query,
-            random_seed=args.random_seed
+            random_seed=args.random_seed,
+            path_mappings=path_mappings
         )
         val_loader = DataLoader(
             val_dataset,

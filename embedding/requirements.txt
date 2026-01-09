@@ -1,1 +1,7 @@
 peft>=0.18.0
+
+# To run with omni models, also need to run these:
+# pip uninstall transformers
+# pip install git+https://github.com/huggingface/transformers@v4.51.3-Qwen2.5-Omni-preview
+# pip install accelerate
+# pip install qwen-omni-utils[decord] -U
