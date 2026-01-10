@@ -319,7 +319,7 @@ def train_epoch(model, dataloader, optimizer, criterion, device, epoch, writer, 
 
             # Run validation if val_loader is provided
             if val_loader is not None:
-                val_loss, val_metrics = validate_step(
+                val_loss, val_metrics, global_step = validate_step(
                     model, val_loader, criterion, device, epoch, writer, global_step
                 )
                 logger.info(f"Step {global_step} - Val Loss: {val_loss:.4f}, "
