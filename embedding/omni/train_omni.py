@@ -23,7 +23,7 @@ from datetime import datetime
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, RandomSampler
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
@@ -66,7 +66,7 @@ def get_dataset_type(dataset_path: str) -> str:
 
 def train_epoch(model, dataloader, optimizer, criterion, device, epoch, writer, global_step,
                 val_loader=None, save_steps=100, output_dir=None, best_val_loss=float('inf'),
-                scheduler=None, use_lora=False):
+                scheduler=None, use_lora=False, max_val_steps=32):
     """Train for one epoch with step-based validation and checkpointing."""
     import time  # Import at function level
 
@@ -320,7 +320,7 @@ def train_epoch(model, dataloader, optimizer, criterion, device, epoch, writer, 
             # Run validation if val_loader is provided
             if val_loader is not None:
                 val_loss, val_metrics, global_step = validate_step(
-                    model, val_loader, criterion, device, epoch, writer, global_step
+                    model, val_loader, criterion, device, epoch, writer, global_step, max_val_steps
                 )
                 logger.info(f"Step {global_step} - Val Loss: {val_loss:.4f}, "
                            f"Pos Sim: {val_metrics['pos_sim']:.3f}, "
@@ -422,7 +422,7 @@ def train_epoch(model, dataloader, optimizer, criterion, device, epoch, writer, 
     return metrics['total_loss'], metrics, global_step, best_val_loss
 
 
-def validate_step(model, dataloader, criterion, device, epoch, writer, global_step):
+def validate_step(model, dataloader, criterion, device, epoch, writer, global_step, max_val_steps=32):
     """Quick validation without TensorBoard per-step logging (used for step-based validation)."""
     model.eval()
     total_loss = 0
@@ -436,6 +436,8 @@ def validate_step(model, dataloader, criterion, device, epoch, writer, global_st
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(dataloader):
+            if batch_idx >= max_val_steps:
+                break
             # Move tensors to device
             query_input_ids = batch['query_input_ids'].to(device)
             query_attention_mask = batch['query_attention_mask'].to(device)
@@ -713,6 +715,8 @@ def main():
                        help='Use query-to-query and positive-to-positive as additional negatives (KaLM-style)')
     parser.add_argument('--save_steps', type=int, default=100,
                        help='Steps interval for saving checkpoints')
+    parser.add_argument('--max_val_steps', type=int, default=32,
+                       help='Maximum number of validation steps to run (default: 32)')
 
     # Dataset parameters
     parser.add_argument('--max_negatives', type=int, default=7,
@@ -817,15 +821,25 @@ def main():
             random_seed=args.random_seed,
             path_mappings=path_mappings
         )
+        
+        # Create a generator with fixed seed for reproducible shuffling
+        val_generator = torch.Generator()
+        val_generator.manual_seed(args.random_seed)
+        
+        # Use RandomSampler with fixed seed for consistent shuffle order
+        val_sampler = RandomSampler(val_dataset, generator=val_generator)
+        
         val_loader = DataLoader(
             val_dataset,
             batch_size=args.batch_size,
-            shuffle=False,
+            sampler=val_sampler,  # Use sampler instead of shuffle
             num_workers=args.num_workers,
             collate_fn=collate_fn_omni,
             pin_memory=True,
             persistent_workers=True if args.num_workers > 0 else False
         )
+        
+        logger.info(f"Validation data: {len(val_dataset)} samples, shuffled with fixed seed={args.random_seed}, max_val_steps={args.max_val_steps}")
 
     # Create model with LoRA support
     model = OmniEmbeddingModel(
@@ -903,7 +917,8 @@ def main():
         train_loss, train_metrics, global_step, best_val_loss = train_epoch(
             model, train_loader, optimizer, criterion, device, epoch, writer, global_step,
             val_loader=val_loader, save_steps=args.save_steps, output_dir=output_dir,
-            best_val_loss=best_val_loss, scheduler=scheduler, use_lora=args.use_lora
+            best_val_loss=best_val_loss, scheduler=scheduler, use_lora=args.use_lora,
+            max_val_steps=args.max_val_steps
         )
 
         logger.info(f"Train Loss: {train_loss:.4f}")
