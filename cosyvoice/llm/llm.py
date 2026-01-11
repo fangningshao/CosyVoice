@@ -21,6 +21,7 @@ import numpy as np
 import torch
 from torch import nn
 import torch.nn.functional as F
+from transformers import AutoTokenizer
 from transformers import Qwen2ForCausalLM
 from torch.nn.utils.rnn import pad_sequence, unpad_sequence
 from cosyvoice.utils.common import IGNORE_ID
@@ -683,9 +684,29 @@ class CosyVoice3LM(Qwen2LM):
         text_token_len = batch['text_token_len'].to(device)
         speech_token = batch['speech_token'].to(device)
         speech_token_len = batch['speech_token_len'].to(device)
-        # NOTE should append instruct_token to sequence, not implemented yet
-        instruct_token = batch['instruct_token'].to(device)
-        instruct_token_len = batch['instruct_token_len'].to(device)
+
+        # Handle missing instruct tokens (for CosyVoice2 data compatibility)
+        if 'instruct_token' not in batch or batch['instruct_token'] is None:
+            if not hasattr(self, 'tokenizer'):
+                # Lazy-init tokenizer (load once)
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    self.llm.model.config._name_or_path,
+                    trust_remote_code=True
+                )
+                self.default_instruct_prompt = "You are a helpful assistant."
+                logging.info(f"instruct_token not provided in the data, using default: '{self.default_instruct_prompt}'")
+                self.default_instruct_tokens = torch.tensor(
+                    self.tokenizer.encode(self.default_instruct_prompt, add_special_tokens=False),
+                    dtype=torch.long
+                )
+
+            batch_size = text_token.shape[0]
+            # Repeat for batch
+            instruct_token = self.default_instruct_tokens.unsqueeze(0).repeat(batch_size, 1).to(device)
+            instruct_token_len = torch.full((batch_size,), instruct_token.shape[1], dtype=torch.long, device=device)
+        else:
+            instruct_token = batch['instruct_token'].to(device)
+            instruct_token_len = batch['instruct_token_len'].to(device)
 
         # 1. encode text_token
         text_token_emb = self.llm.model.model.embed_tokens(text_token)

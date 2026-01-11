@@ -67,7 +67,6 @@ class CosyVoiceModel:
         self.llm.to(self.device).eval()
         self.flow.load_state_dict(torch.load(flow_model, map_location=self.device, weights_only=True), strict=True)
         self.flow.to(self.device).eval()
-
         # in case hift_model is a hifigan model
         hift_state_dict = {k.replace('generator.', ''): v for k, v in torch.load(hift_model, map_location=self.device, weights_only=True).items()}
         self.hift.load_state_dict(hift_state_dict, strict=True)

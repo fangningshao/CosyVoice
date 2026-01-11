@@ -23,7 +23,9 @@ import time
 import torch
 
 
-def job(utt_list, parquet_file, utt2parquet_file, spk2parquet_file):
+def job(utt_list, parquet_file, utt2parquet_file, spk2parquet_file,
+        utt2wav, utt2text, utt2spk, utt2embedding, spk2embedding, utt2speech_token,
+        is_dpo, is_instruct, utt2reject_speech_token, utt2instruct):
     start_time = time.time()
     data_list = []
     for utt in tqdm(utt_list):
@@ -35,10 +37,10 @@ def job(utt_list, parquet_file, utt2parquet_file, spk2parquet_file):
     uttembedding_list = [utt2embedding[utt] for utt in utt_list]
     spkembedding_list = [spk2embedding[utt2spk[utt]] for utt in utt_list]
     speech_token_list = [utt2speech_token.get(utt, []) for utt in utt_list]
-    if args.dpo:
-        reject_speech_token_list = [utt2reject_speech_token[utt] for utt in utt_list]
-    if args.instruct:
-        instruct_list = [utt2instruct[utt] for utt in utt_list]
+    if is_dpo:
+        reject_speech_token_list = [utt2reject_speech_token.get(utt, []) for utt in utt_list]
+    if is_instruct:
+        instruct_list = [utt2instruct.get(utt, []) for utt in utt_list]
 
     # 保存到parquet,utt2parquet_file,spk2parquet_file
     df = pd.DataFrame()
@@ -50,9 +52,9 @@ def job(utt_list, parquet_file, utt2parquet_file, spk2parquet_file):
     df['utt_embedding'] = uttembedding_list
     df['spk_embedding'] = spkembedding_list
     df['speech_token'] = speech_token_list
-    if args.dpo:
+    if is_dpo:
         df['reject_speech_token'] = reject_speech_token_list
-    if args.instruct:
+    if is_instruct:
         df['instruct'] = instruct_list
     df.to_parquet(parquet_file)
     with open(utt2parquet_file, 'w') as f:
@@ -86,16 +88,16 @@ if __name__ == "__main__":
                         help='Use Direct Preference Optimization')
     args = parser.parse_args()
 
-    utt2wav, utt2text, utt2spk, utt2instruct = {}, {}, {}, {}
-    with open('{}/wav.scp'.format(args.src_dir)) as f:
+    utt2wav, utt2text, utt2spk, utt2instruct, utt2reject_speech_token = {}, {}, {}, {}, {}
+    with open('{}/wav.scp'.format(args.src_dir), 'r', encoding='utf-8') as f:
         for l in f:
             l = l.replace('\n', '').split()
             utt2wav[l[0]] = l[1]
-    with open('{}/text'.format(args.src_dir)) as f:
+    with open('{}/text'.format(args.src_dir), 'r', encoding='utf-8') as f:
         for l in f:
             l = l.replace('\n', '').split()
             utt2text[l[0]] = ' '.join(l[1:])
-    with open('{}/utt2spk'.format(args.src_dir)) as f:
+    with open('{}/utt2spk'.format(args.src_dir), 'r', encoding='utf-8') as f:
         for l in f:
             l = l.replace('\n', '').split()
             utt2spk[l[0]] = l[1]
@@ -121,7 +123,10 @@ if __name__ == "__main__":
         parquet_list.append(parquet_file)
         utt2parquet_list.append(utt2parquet_file)
         spk2parquet_list.append(spk2parquet_file)
-        pool.apply_async(job, (utts[j: j + args.num_utts_per_parquet], parquet_file, utt2parquet_file, spk2parquet_file))
+        pool.apply_async(job, (utts[j: j + args.num_utts_per_parquet],
+                               parquet_file, utt2parquet_file, spk2parquet_file, utt2wav, utt2text, utt2spk, utt2embedding,
+                               spk2embedding, utt2speech_token, args.dpo, args.instruct, utt2reject_speech_token, utt2instruct))
+
     pool.close()
     pool.join()
 
