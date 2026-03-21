@@ -27,7 +27,8 @@ import torch
 
 
 def job(utt_list, parquet_file, utt2parquet_file, spk2parquet_file, 
-        utt2wav, utt2text, utt2spk, utt2embedding, spk2embedding, utt2speech_token, args_dpo, args_instruct):
+        utt2wav, utt2text, utt2spk, utt2embedding, spk2embedding, utt2speech_token, args_dpo, args_instruct,
+        utt2reject_speech_token=None, utt2instruct=None):
     start_time = time.time()
     data_list = []
     for utt in tqdm(utt_list):
@@ -139,7 +140,8 @@ if __name__ == "__main__":
         # 存储异步任务结果
         result = pool.apply_async(job, (utts[j: j + args.num_utts_per_parquet], 
                                       parquet_file, utt2parquet_file, spk2parquet_file,
-                                      utt2wav, utt2text, utt2spk, utt2embedding, spk2embedding, utt2speech_token, args.dpo, args.instruct))
+                                      utt2wav, utt2text, utt2spk, utt2embedding, spk2embedding, utt2speech_token, args.dpo, args.instruct,
+                                      utt2reject_speech_token, utt2instruct))
         results.append(result)
 
     # Close pool before waiting for results
